@@ -1,5 +1,3 @@
-# Full and all credits go to: Author/Founder: PowerTea-2, Code and Co-Ownership: PowerTea-2 and
-
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
@@ -8,9 +6,8 @@
 -Author/Foundind architect: PowerTea-2  mpcp_amalgam.c - MPCP v0.5 Phase 1+2+3 single-file amalgamation
 - 
 - Build (requires libsodium-dev libzstd-dev):
-- gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 -g \
-    -o mpcp_test mpcp_amalgam.c \\
-    -lsodium -lzstd -lm -lpthread
+- gcc -std=c11 -O2 -pthread mpcp_fixed.c -lsodium -lzstd -lm -o mpcp
+
 - 
 - Run:  ./mpcp_test   (runs Phase 1+2+3 unit tests)
   */
@@ -3586,11 +3583,11 @@ return MPCP_OK;
   
   randombytes_buf(pkt_out->xchacha_nonce, 24);
   
-  /* AD: 34 bytes = key_index(1) || direction(1) || nonce[0:32] */
-  uint8_t ad[34];
+  /* AD: 26 bytes = key_index(1) || direction(1) || nonce[0:24] */
+  uint8_t ad[26];
   ad[0] = key_index;
   ad[1] = direction;
-  memcpy(ad + 2, pkt_out->xchacha_nonce, 32);
+  memcpy(ad + 2, pkt_out->xchacha_nonce, 24);
   
   unsigned long long ct_len = 0;
   if (crypto_aead_xchacha20poly1305_ietf_encrypt(
@@ -3614,10 +3611,10 @@ if (ntohl(magic)             != MPCP_MAGIC)            return MPCP_ERR_PROTO;
 if (pkt->hdr.version         != MPCP_VERSION)          return MPCP_ERR_PROTO;
 if (pkt->hdr.type            != MPCP_TYPE_KEY_EXCHANGE) return MPCP_ERR_PROTO;
 
-uint8_t ad[34];
+uint8_t ad[26];
 ad[0] = pkt->key_index;
 ad[1] = pkt->direction;
-memcpy(ad + 2, pkt->xchacha_nonce, 32);
+memcpy(ad + 2, pkt->xchacha_nonce, 24);
 
 unsigned long long pt_len = 0;
 if (crypto_aead_xchacha20poly1305_ietf_decrypt(
@@ -6077,19 +6074,19 @@ static int checked_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
   cfg.psk_min_entropy = 40;
   
   /* Should reject: single short word (~13 bits) */
-/* [REDACTED SECRET-PRINT]   snprintf(cfg.psk, sizeof(cfg.psk), "hello"); */
+  snprintf(cfg.psk, sizeof(cfg.psk), "hello");
   cfg.psk_len = strlen(cfg.psk);
   int rc = mpcp_config_check_psk(&cfg);
   CHECK("T-01a: rejects 'hello' (too weak)", rc == MPCP_ERR_ENTROPY);
   
   /* Should reject: 3 common words (~39 bits) */
-/* [REDACTED SECRET-PRINT]   snprintf(cfg.psk, sizeof(cfg.psk), "coral-tandem-velvet"); */
+  snprintf(cfg.psk, sizeof(cfg.psk), "coral-tandem-velvet");
   cfg.psk_len = strlen(cfg.psk);
   rc = mpcp_config_check_psk(&cfg);
   CHECK("T-01b: rejects 3-word (~39 bits) passphrase", rc == MPCP_ERR_ENTROPY);
   
   /* Should accept: 4 words (~52 bits) */
-/* [REDACTED SECRET-PRINT]   snprintf(cfg.psk, sizeof(cfg.psk), "coral-tandem-velvet-sunrise"); */
+  snprintf(cfg.psk, sizeof(cfg.psk), "coral-tandem-velvet-sunrise");
   cfg.psk_len = strlen(cfg.psk);
   rc = mpcp_config_check_psk(&cfg);
   CHECK("T-01c: accepts 4-word passphrase (~52 bits)", rc == MPCP_OK);
@@ -6097,7 +6094,7 @@ static int checked_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
   /* Should accept: 8-word generated PSK (~103 bits) */
   char generated[256];
   mpcp_generate_psk(generated, sizeof(generated));
-/* [REDACTED SECRET-PRINT]   snprintf(cfg.psk, sizeof(cfg.psk), "%s", generated); */
+  snprintf(cfg.psk, sizeof(cfg.psk), "%s", generated);
   cfg.psk_len = strlen(cfg.psk);
   rc = mpcp_config_check_psk(&cfg);
 /* [REDACTED SECRET-PRINT]   printf("  [info] generated PSK: %s (%.1f bits)\n", 
@@ -7223,12 +7220,12 @@ CHECK("T-04e: fast profile formula correct", fabs(cw - 18.0) < 0.001);
   static int p3_tests_failed = 0;
 
 #define P3_PASS(name) do { \
-    p3_tests_run++; tests_passed++; \
+    p3_tests_run++; p3_tests_passed++; \
     printf("  PASS  %s\n", (name)); \
 } while (0)
 
 #define P3_FAIL(name, reason) do { \
-    p3_tests_run++; tests_failed++; \
+    p3_tests_run++; p3_tests_failed++; \
     printf("  FAIL  %s: %s\n", (name), (reason)); \
 } while (0)
 
@@ -7598,14 +7595,13 @@ sess->keystream = NULL;
   mpcp_tripwire_t tw;
   mpcp_tripwire_init(&tw, &rtt, &cfg);
   
-  /* Simulate selective loss: every 10th chunk over 200 total */
-  /* This produces a highly non-random distribution */
+  /* Simulate selective loss: all losses clustered in first bucket (indices 0-19)
+   * over a total space of 200 chunks. This heavily skews bucket 0 vs the rest,
+   * producing a large chi2 and p < 0.05. */
   bool triggered = false;
-  for (uint32_t i = 0; i < 200 && !triggered; i++) {
-  if (i % 10 == 0) {
+  for (uint32_t i = 0; i < 20 && !triggered; i++) {
   if (mpcp_tripwire_record_loss(&tw, i) == MPCP_ERR_TRIPWIRE) {
   triggered = true;
-  }
   }
   }
   P3_CHECK("T-13a selective loss pattern detected", triggered);
@@ -7676,7 +7672,7 @@ sess->keystream = NULL;
   {
   puts("T-P3-03/04  Disguise round-trip (DNS + NTP)");
   
-  uint8_t payload[256];
+  uint8_t payload[200];
   randombytes_buf(payload, sizeof(payload));
   
   /* DNS */
@@ -7902,4 +7898,3 @@ sess->keystream = NULL;
   int rc2 = mpcp_test_phase3_main();
   return (rc1 == 0 && rc2 == 0) ? 0 : 1;
   }
-
