@@ -2,7 +2,7 @@
 
 <br>
 
-# ☾ AetherSync ☽
+# ☾ AethroSync ☽
 ### 🌌 Nightbound synchronization for MPCP 🌌
 
 <sub><em>built under starlight for precision, privacy, and event-correlation research</em></sub>
@@ -18,7 +18,7 @@
 ༺═⋆════════════════════════════⋆═༻  
 
 **Protocol** · MPCP  
-**Project** · AetherSync  
+**Project** · AethroSync  
 **Maintainer** · PowerTea-2  
 
 </div>
@@ -49,10 +49,10 @@ It is engineered for:
 
 **MPCP** is the protocol.
 
-**AetherSync** is the implementation and tooling built around it.
+**AethroSync** is the implementation and tooling built around it.
 
 - MPCP defines behavior, timing, and cryptographic structure  
-- AetherSync executes and exposes that system  
+- AethroSync executes and exposes that system  
 
 This separation ensures the protocol remains independently verifiable.
 
@@ -104,7 +104,7 @@ This separation ensures the protocol remains independently verifiable.
 ༺═══════════════◈═══════════════༻  
 
     gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 \
-        aethersync.c -o aethersync -lsodium -lzstd -lm -lpthread
+        aethrosync.c -o aethersync -lsodium -lzstd -lm -lpthread
 
 <br>
 
