@@ -34,6 +34,7 @@
   #include <fcntl.h>
   #include <math.h>
   #include <netdb.h>
+#include <ifaddrs.h>    /* getifaddrs: direct interface enumeration */
   #include <netinet/in.h>
   #include <pthread.h>
   #include <sched.h>
@@ -5619,10 +5620,6 @@ ssize_t sent = sendto(sock, pkt, pkt_len, 0,
                       (const struct sockaddr *)(const void *)peer,
                       sizeof(*peer));
 
-if (sent < 0)
-    fprintf(stderr, "[send_chunk] sendto seq=%u len=%zu FAILED: %s\n",
-            slot->seq_index, pkt_len, strerror(errno));
-
 return (sent > 0) ? MPCP_OK : MPCP_ERR_IO;
 
 }
@@ -5663,7 +5660,6 @@ while (data_consumed < ctx->plan.n_chunks) { /* exit when all DATA chunks sent; 
     memcpy(&dest, ctx->peer_addr, sizeof(dest));
     dest.sin_port = htons(port);
 
-    fprintf(stderr, "[send] seq %u -> port %u\n", seq, port);
     (void)send_chunk_packet(persist_sock, &dest, ctx->sess, slot,
                              MPCP_TYPE_DATA_CHUNK, 0,
                              ctx->cfg->zerocopy);
@@ -6185,11 +6181,6 @@ int *fds = calloc(n, sizeof(int));
 if (!fds) return NULL;
 for (uint32_t i = 0; i < n; i++) {
     fds[i] = open_udp_socket_on_port(a->ports[i]);
-    if (fds[i] < 0)
-        fprintf(stderr, "[recv-t1] WARN: failed to bind port %u (seq %u): %s\n",
-                a->ports[i], i, strerror(errno));
-    else
-        fprintf(stderr, "[recv-t1] bound port %u -> seq %u\n", a->ports[i], i);
 }
 
 uint8_t *pkt = malloc(pkt_max);
@@ -6286,8 +6277,6 @@ while (received < n && mpcp_now_ns() < deadline_ns) {
                    (const struct sockaddr *)&from_sender, from_len);
         }
 
-        fprintf(stderr, "[recv-t1] got seq %u on port %u\n",
-                pkt_seq, a->ports[i]);
         got[i] = true;
         received++;
         any = true;
@@ -6298,8 +6287,6 @@ while (received < n && mpcp_now_ns() < deadline_ns) {
         nanosleep(&ts, NULL);
     }
 }
-fprintf(stderr, "[recv-t1] done: received %u/%u chunks\n", received, n);
-
 free(got);
 free(pkt);
 for (uint32_t i = 0; i < n; i++) if (fds[i] >= 0) close(fds[i]);
@@ -6496,18 +6483,14 @@ for (;;) {
                 if (dbuf) {
                     size_t dlen = ZSTD_decompress(dbuf, dbound, buf, len);
                     if (!ZSTD_isError(dlen)) {
-                        fprintf(stderr, "[writer] seq %u: decompress %u->%zu bytes\n", ws, len, dlen);
-                        if (write(ctx->out_fd, dbuf, dlen) != (ssize_t)dlen)
+                            if (write(ctx->out_fd, dbuf, dlen) != (ssize_t)dlen)
                             atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
                         else
                             resume_record(ctx->out_path, ws);
-                    } else {
-                        fprintf(stderr, "[writer] seq %u: ZSTD_decompress FAILED (len=%u)\n", ws, len);
                     }
                     free(dbuf);
                 }
             } else {
-                fprintf(stderr, "[writer] seq %u: raw write %u bytes\n", ws, len);
                 if (write(ctx->out_fd, buf, len) != (ssize_t)len)
                     atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
                 else
@@ -8926,10 +8909,6 @@ static void __attribute__((unused)) progress_done(progress_t *p, bool ok)
     fflush(stderr);
 }
 
-/* Progress polling thread
-}
-
-
 /* Progress polling thread - polls atomic counter and redraws bar */
 typedef struct {
     progress_t       *bar;
@@ -9097,11 +9076,6 @@ static void banner(const char *title)
         printf("\n");
     }
 }
-
-
-/* ===
-}
-
 
 
 /* =========================================================
@@ -9782,10 +9756,11 @@ static int run_bench(void)
                 uint8_t *tmp = malloc(bound);
                 if (tmp) {
                     size_t clen = ZSTD_compress(tmp, bound, raw, bench_size, 3);
-                    size_t csz  = ZSTD_isError(clen) ? bench_size : clen;
+                    bool sc = ZSTD_isError(clen) ||
+                              ((double)clen / (double)bench_size > 0.95);
                     mpcp_chunk_plan_t plan;
                     memset(&plan, 0, sizeof(plan));
-                    if (mpcp_chunker_plan(csz, cfg.chunk_pad_size, ZSTD_isError(clen), &plan) == MPCP_OK)
+                    if (mpcp_chunker_plan(bench_size, cfg.chunk_pad_size, sc, &plan) == MPCP_OK)
                         n_chunks = plan.n_chunks;
                     free(tmp);
                 }
@@ -9924,10 +9899,10 @@ static int run_selftest(void)
                 uint8_t *tmp = malloc(bound);
                 if (tmp) {
                     size_t clen = ZSTD_compress(tmp, bound, raw, sz, 3);
+                    bool sc = ZSTD_isError(clen) ||
+                              ((double)clen / (double)sz > 0.95);
                     mpcp_chunk_plan_t plan; memset(&plan, 0, sizeof(plan));
-                    if (mpcp_chunker_plan(ZSTD_isError(clen) ? sz : clen,
-                                          cfg.chunk_pad_size,
-                                          ZSTD_isError(clen), &plan) == MPCP_OK)
+                    if (mpcp_chunker_plan(sz, cfg.chunk_pad_size, sc, &plan) == MPCP_OK)
                         nc = plan.n_chunks;
                     free(tmp);
                 }
@@ -10367,25 +10342,35 @@ static int run_transfer(void)
         /* Step 1: Reflect pings as pongs so sender can calibrate */
         fw_maybe_open(cfg.port_base, cfg.port_range);
         banner("Waiting for sender");
-        /* Show receiver's own IPs so they know what to tell the sender */
+        /* Show receiver's own IPs using getifaddrs (reads kernel interface list
+         * directly — immune to /etc/hosts misconfigurations that make
+         * gethostname/getaddrinfo return 127.0.0.1 or Tailscale/VPN IPs). */
         {
-            char hostname[256];
-            if (gethostname(hostname, sizeof(hostname)) == 0) {
-                struct addrinfo hints, *res, *p;
-                memset(&hints, 0, sizeof(hints));
-                hints.ai_family   = AF_INET;
-                hints.ai_socktype = SOCK_DGRAM;
+            struct ifaddrs *ifap, *ifa;
+            if (getifaddrs(&ifap) == 0) {
                 printf("  Your IP addresses (give one of these to the sender):\n");
-                if (getaddrinfo(hostname, NULL, &hints, &res) == 0) {
-                    for (p = res; p != NULL; p = p->ai_next) {
-                        char ipstr[INET_ADDRSTRLEN];
-                        struct sockaddr_in *sa = (struct sockaddr_in *)p->ai_addr;
-                        inet_ntop(AF_INET, &sa->sin_addr, ipstr, sizeof(ipstr));
-                        if (strcmp(ipstr, "127.0.0.1") != 0)
-                            printf("    %s\n", ipstr);
-                    }
-                    freeaddrinfo(res);
+                bool found_any = false;
+                for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+                    if (!ifa->ifa_addr) continue;
+                    if (ifa->ifa_addr->sa_family != AF_INET) continue;
+                    struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+                    char ipstr[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &sa->sin_addr, ipstr, sizeof(ipstr));
+                    /* Skip loopback and link-local (169.254.x.x) */
+                    uint32_t ip = ntohl(sa->sin_addr.s_addr);
+                    if ((ip >> 24) == 127) continue;           /* 127.x.x.x */
+                    if ((ip >> 16) == 0xA9FE) continue;        /* 169.254.x.x */
+                    if (g_ui_colour)
+                        printf("    %s%s%s  %s(%s)%s\n",
+                               C_PLUM, ipstr, C_RESET,
+                               C_GREY, ifa->ifa_name, C_RESET);
+                    else
+                        printf("    %-16s  (%s)\n", ipstr, ifa->ifa_name);
+                    found_any = true;
                 }
+                if (!found_any)
+                    printf("    (no non-loopback interfaces found — check network)\n");
+                freeifaddrs(ifap);
             }
         }
         printf("  Listening for calibration pings on port %u ...\n", cfg.port_base);
