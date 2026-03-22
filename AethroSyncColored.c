@@ -58,6 +58,179 @@
 /* Forward declarations for patched wrappers */
 static ssize_t checked_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest, socklen_t destlen);
 static int __attribute__((unused)) checked_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg);
+
+/* =============================================================
+ * ██████╗ ██╗   ██╗██████╗ ██████╗ ██╗     ███████╗
+ * ██╔══██╗██║   ██║██╔══██╗██╔══██╗██║     ██╔════╝
+ * ██████╔╝██║   ██║██████╔╝██████╔╝██║     █████╗
+ * ██╔═══╝ ██║   ██║██╔══██╗██╔═══╝ ██║     ██╔══╝
+ * ██║     ╚██████╔╝██║  ██║██║     ███████╗███████╗
+ * ╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚══════╝╚══════╝
+ *  MPCP Purple UI — ANSI true-colour terminal theme
+ * ============================================================= */
+
+/* Colour detection: set NO_COLOR=1 or UI_NO_COLOUR=1 to disable */
+static bool g_ui_colour = false;
+
+/* True-colour ANSI macros */
+#define C_PLUM    "\033[38;2;200;150;255m"   /* bright violet       */
+#define C_VIOLET  "\033[38;2;160;100;220m"   /* medium purple       */
+#define C_GRAPE   "\033[38;2;110;60;170m"    /* deep purple         */
+#define C_ORCHID  "\033[38;2;180;120;240m"   /* orchid              */
+#define C_WHITE   "\033[38;2;230;220;255m"   /* soft white          */
+#define C_GREY    "\033[38;2;130;120;150m"   /* muted grey          */
+#define C_LIME    "\033[38;2;140;255;160m"   /* success green       */
+#define C_ROSE    "\033[38;2;255;100;110m"   /* error red           */
+#define C_GOLD    "\033[38;2;255;220;100m"   /* warning amber       */
+#define C_CYAN    "\033[38;2;100;220;255m"   /* info cyan           */
+#define C_RESET   "\033[0m"
+#define C_BOLD    "\033[1m"
+#define C_DIM     "\033[2m"
+#define C_BLINK   "\033[5m"
+#define C_NOCURSOR "\033[?25l"
+#define C_CURSOR   "\033[?25h"
+
+/* Particle/glow characters */
+#define GLYPH_DOT   "\xc2\xb7"          /* · middle dot         */
+#define GLYPH_STAR  "\xe2\x98\x85"      /* ★ black star         */
+#define GLYPH_LOCK  "\xf0\x9f\x94\x92" /* 🔒 padlock (UTF-8)   */
+#define GLYPH_BOLT  "\xe2\x9a\xa1"      /* ⚡ lightning         */
+#define GLYPH_OK    "\xe2\x9c\x93"      /* ✓ check              */
+#define GLYPH_FAIL  "\xe2\x9c\x97"      /* ✗ cross              */
+#define GLYPH_ARR   "\xe2\x86\x92"      /* → arrow              */
+#define GLYPH_WAVE  "\xe2\x88\xbf"      /* ∿ sine wave          */
+#define GLYPH_SKULL "\xe2\x98\xa0"      /* ☠ tripwire warning   */
+#define GLYPH_GEM   "\xe2\x97\x86"      /* ◆ diamond            */
+
+static void ui_sleep_ms(int ms)
+{
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)ms * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+static void ui_colour_init(void)
+{
+    const char *term   = getenv("TERM");
+    const char *no_col = getenv("NO_COLOR");
+    const char *ui_no  = getenv("UI_NO_COLOUR");
+    g_ui_colour = isatty(STDOUT_FILENO)
+                  && no_col == NULL && ui_no == NULL
+                  && term != NULL && strcmp(term, "dumb") != 0;
+}
+
+/* ── PARTICLE BURST: tiny sparks scatter when the logo lands ── */
+static void ui_particle_burst(void)
+{
+    if (!g_ui_colour) return;
+    static const char *sparks[] = {
+        "\xe2\x80\xa2", /* • */
+        "\xe2\x81\x82", /* ⁂ */
+        "\xc2\xb7",     /* · */
+        "\xe2\x97\x8c", /* ◌ */
+        "\xe2\x97\xa6", /* ◦ */
+    };
+    const char *cols[] = {
+        "\033[38;2;200;150;255m",
+        "\033[38;2;160;80;220m",
+        "\033[38;2;130;60;190m",
+        "\033[38;2;240;180;255m",
+        "\033[38;2;100;40;160m",
+    };
+    /* Print 3 rows of drifting sparks */
+    for (int row = 0; row < 3; row++) {
+        printf("  ");
+        for (int col = 0; col < 36; col++) {
+            int si = (row * 7 + col * 3) % 5;
+            if ((row + col) % 3 == 0)
+                printf("%s%s%s", cols[si % 5], sparks[si], C_RESET);
+            else
+                printf(" ");
+        }
+        printf("\n");
+        fflush(stdout);
+        ui_sleep_ms(40);
+    }
+}
+
+/* ── GLOW PULSE: line that throbs bright→dim once ── */
+static void ui_glow_line(int width)
+{
+    if (!g_ui_colour) { printf("\n"); return; }
+    /* Bright pass */
+    printf("  %s", C_PLUM);
+    for (int i = 0; i < width; i++) printf("\xe2\x94\x80");
+    printf("%s", C_RESET);
+    fflush(stdout);
+    ui_sleep_ms(60);
+    /* Dim pass (rewrite same line) */
+    printf("\r  %s", C_GRAPE);
+    for (int i = 0; i < width; i++) printf("\xe2\x94\x80");
+    printf("%s\n", C_RESET);
+    fflush(stdout);
+}
+
+/* ── LOGO: gradient line-by-line reveal then particle burst ── */
+static void ui_print_logo(void)
+{
+    static const char *logo[] = {
+        "           /\\_/\\ *                    *        *                    ",
+        "     *    ( o.o )     *        *                        *           ",
+        "           > - <                                  *                 ",
+        "         _        _   _              ____                           ",
+        "        / \\   ___| |_| |__  _ __ ___/ ___| _   _ _ __   ___    *   ",
+        " *     / _ \\ / _ \\ __| '_ \\| '__/ _ \\___ \\| | | | '_ \\ / __|       ",
+        "      / ___ \\  __/ |_| | | | | | (_) |__) | |_| | | | | (__      * ",
+        "     /_/   \\_\\__|\\__|_| |_|_|  \\___/____/ \\__, |_| |_|\\___|       ",
+        "  *                                        |___/                    ",
+        "                                        *            *        *     ",
+        "       *     *      *         *      _                              ",
+        "         *                *       _\\( )/_      *                    ",
+        "                                   /(O)\\                            ",
+    };
+    static const char *grad[] = {
+        "\033[38;2;80;40;120m",
+        "\033[38;2;95;48;140m",
+        "\033[38;2;110;55;160m",
+        "\033[38;2;130;70;185m",
+        "\033[38;2;150;85;205m",
+        "\033[38;2;165;95;215m",
+        "\033[38;2;175;105;225m",
+        "\033[38;2;185;115;235m",
+        "\033[38;2;195;128;245m",
+        "\033[38;2;200;135;250m",
+        "\033[38;2;205;142;252m",
+        "\033[38;2;208;150;254m",
+        "\033[38;2;210;160;255m",
+    };
+    int n = 13;
+    printf("\n");
+    if (g_ui_colour) printf(C_NOCURSOR);
+
+    for (int i = 0; i < n; i++) {
+        if (g_ui_colour) printf("%s", grad[i]);
+        printf("%s", logo[i]);
+        if (g_ui_colour) printf("%s", C_RESET);
+        printf("\n");
+        fflush(stdout);
+        ui_sleep_ms(55);
+    }
+
+    /* Subtitle with lock glyph */
+    if (g_ui_colour) {
+        printf("  %s" GLYPH_LOCK "  %sMulti-Port Catch Protocol%s  %sv0.5%s\n",
+               C_PLUM, C_VIOLET, C_RESET, C_GREY, C_RESET);
+    } else {
+        printf("  Multi-Port Catch Protocol  v0.5\n");
+    }
+
+    ui_glow_line(38);
+    ui_particle_burst();
+
+    if (g_ui_colour) printf(C_CURSOR);
+}
+
+
+
 /* =========================================================
 
 - Declarations (from include headers - guards stripped)
@@ -1677,40 +1850,33 @@ sodium_free(p);
  * ========================================================= */
 static void mpcp_perror(const char *stage, int rc)
 {
-    fprintf(stderr, "\n  error [%s]: %s\n", stage, mpcp_strerror((mpcp_err_t)rc));
+    if (g_ui_colour)
+        fprintf(stderr, "\n  %s" GLYPH_FAIL " error [%s]:%s %s\n",
+                C_ROSE, stage, C_RESET, mpcp_strerror((mpcp_err_t)rc));
+    else
+        fprintf(stderr, "\n  error [%s]: %s\n", stage, mpcp_strerror((mpcp_err_t)rc));
+
+    const char *hint = NULL;
+    const char *icon = GLYPH_ARR;
     switch ((mpcp_err_t)rc) {
-        case MPCP_ERR_ENTROPY:
-            fprintf(stderr, "  hint:  use 4+ random words or let MPCP generate a PSK\n");
-            break;
-        case MPCP_ERR_CRYPTO:
-            fprintf(stderr, "  hint:  PSK mismatch between sender and receiver, or packet was tampered\n");
-            break;
-        case MPCP_ERR_TIMEOUT:
-            fprintf(stderr, "  hint:  check the receiver is running and listening on the correct port\n");
-            break;
-        case MPCP_ERR_PROTO:
-            fprintf(stderr, "  hint:  version mismatch or corrupted packet - both sides must run the same build\n");
-            break;
-        case MPCP_ERR_TRIPWIRE:
-            fprintf(stderr, "  hint:  anomalous RTT or loss pattern detected - possible interception; session aborted\n");
-            break;
-        case MPCP_ERR_NAT:
-            fprintf(stderr, "  hint:  NAT traversal failed - try the internet profile or forward the port manually\n");
-            break;
-        case MPCP_ERR_IO:
-            fprintf(stderr, "  hint:  check the file path exists and you have read/write permissions\n");
-            break;
-        case MPCP_ERR_ALLOC:
-            fprintf(stderr, "  hint:  out of memory - try a smaller file or a machine with more RAM\n");
-            break;
-        case MPCP_ERR_UNSUPPORTED:
-            fprintf(stderr, "  hint:  a required kernel feature is missing - update your kernel or disable memory_lock\n");
-            break;
-        case MPCP_ERR_PARAM:
-            fprintf(stderr, "  hint:  internal parameter error - please report this as a bug\n");
-            break;
-        default:
-            break;
+        case MPCP_ERR_ENTROPY:   hint = "use 4+ random words or let MPCP generate a PSK"; break;
+        case MPCP_ERR_CRYPTO:    hint = "PSK mismatch between sender and receiver, or packet was tampered"; break;
+        case MPCP_ERR_TIMEOUT:   hint = "check the receiver is running and listening on the correct port"; break;
+        case MPCP_ERR_PROTO:     hint = "version mismatch or corrupted packet - both sides must run the same build"; break;
+        case MPCP_ERR_TRIPWIRE:  hint = "anomalous RTT detected - possible interception; session aborted";
+                                 icon = GLYPH_SKULL; break;
+        case MPCP_ERR_NAT:       hint = "NAT traversal failed - try internet profile or forward the port manually"; break;
+        case MPCP_ERR_IO:        hint = "check the file path exists and you have read/write permissions"; break;
+        case MPCP_ERR_ALLOC:     hint = "out of memory - try a smaller file or a machine with more RAM"; break;
+        case MPCP_ERR_UNSUPPORTED: hint = "kernel feature missing - update kernel or disable memory_lock"; break;
+        case MPCP_ERR_PARAM:     hint = "internal parameter error - please report this as a bug"; break;
+        default: break;
+    }
+    if (hint) {
+        if (g_ui_colour)
+            fprintf(stderr, "  %s%s hint:%s  %s\n", C_GOLD, icon, C_RESET, hint);
+        else
+            fprintf(stderr, "  hint:  %s\n", hint);
     }
     fprintf(stderr, "\n");
 }
@@ -5777,40 +5943,42 @@ return NULL;
   mpcp_chunker_detect_compressibility(probe, probe_sz, &plan);
   free(probe);
   
-  /* Determine compressed size to build plan */
-  size_t compressed_size;
-  if (plan.skip_compression) {
-  compressed_size = file_size;
-  } else {
-  /* Estimate: compress to a temp buffer */
-  size_t bound = ZSTD_compressBound(file_size);
-  uint8_t *tmp = malloc(bound);
-  if (!tmp) { close(file_fd); return MPCP_ERR_ALLOC; }
-  
-   uint8_t *raw = malloc(file_size);
-   if (!raw) { free(tmp); close(file_fd); return MPCP_ERR_ALLOC; }
-   if (read(file_fd, raw, file_size) != (ssize_t)file_size) {
-       free(raw); free(tmp); close(file_fd); return MPCP_ERR_IO;
-   }
-   if (lseek(file_fd, 0, SEEK_SET) < 0) {
-       free(raw); free(tmp); close(file_fd); return MPCP_ERR_IO;
-   }
-  
-   size_t clen = ZSTD_compress(tmp, bound, raw, file_size,
-                                cfg->zstd_level);
-   free(raw);
-   free(tmp);
-  
-   if (ZSTD_isError(clen)) {
-       plan.skip_compression = true;
-       compressed_size = file_size;
-   } else {
-       compressed_size = clen;
-   }
-  
+  /* Plan is always based on file_size.
+   *
+   * Architecture: T2 compressor compresses each chunk INDEPENDENTLY from
+   * the raw file bytes that T1 reader supplies. n_chunks must therefore be
+   * derived from file_size so that the reader reads the correct number of
+   * bytes per chunk. Using clen (whole-file compressed size) was a bug:
+   * it made base_chunk_bytes = clen/n_chunks, so T1 only read clen bytes
+   * total from the original file, truncating every compressible transfer.
+   *
+   * Compressibility detection (probe) still determines whether T2 skips
+   * compression. The full-file ratio check ensures skip_compression matches
+   * exactly what the precompute block sent in transfer_info. */
+  if (!plan.skip_compression) {
+      /* Re-verify with full file: if ratio > 0.95, treat as incompressible */
+      size_t bound = ZSTD_compressBound(file_size);
+      uint8_t *tmp = malloc(bound);
+      if (tmp) {
+          uint8_t *raw = malloc(file_size);
+          if (raw) {
+              if (read(file_fd, raw, file_size) == (ssize_t)file_size) {
+                  size_t clen = ZSTD_compress(tmp, bound, raw, file_size, cfg->zstd_level);
+                  if (ZSTD_isError(clen) ||
+                      (double)clen / (double)file_size > 0.95) {
+                      plan.skip_compression = true;
+                  }
+              }
+              if (lseek(file_fd, 0, SEEK_SET) < 0) {
+                  free(raw); free(tmp); close(file_fd); return MPCP_ERR_IO;
+              }
+              free(raw);
+          }
+          free(tmp);
+      }
   }
-  
-  int rc = mpcp_chunker_plan(compressed_size, cfg->chunk_pad_size,
+
+  int rc = mpcp_chunker_plan(file_size, cfg->chunk_pad_size,
   plan.skip_compression, &plan);
   if (rc != MPCP_OK) { close(file_fd); return rc; }
   
@@ -8680,26 +8848,38 @@ static void __attribute__((unused)) progress_draw(progress_t *p, uint32_t done)
                      : 0.0;
 
     if (p->is_tty) {
-        /* Brutalist block bar: filled=█ empty=░ */
-        fprintf(stderr, "\r  %s [", p->label);
-        for (uint32_t i = 0; i < PBAR_WIDTH; i++)
-            fputc(i < fill ? '\xe2' : ' ', stderr); /* see below */
-        /* Build bar with UTF-8 block chars */
-        fprintf(stderr, "\r  %s [", p->label);
-        for (uint32_t i = 0; i < PBAR_WIDTH; i++) {
-            if (i < fill) {
-                /* UTF-8: U+2588 FULL BLOCK = 0xE2 0x96 0x88 */
-                fputc(0xE2, stderr); fputc(0x96, stderr); fputc(0x88, stderr);
-            } else {
-                /* UTF-8: U+2591 LIGHT SHADE = 0xE2 0x96 0x91 */
-                fputc(0xE2, stderr); fputc(0x96, stderr); fputc(0x91, stderr);
+        if (g_ui_colour) {
+            /* Purple gradient bar with glowing head */
+            fprintf(stderr, "\r  %s%s%s [", C_GREY, p->label, C_RESET);
+            for (uint32_t i = 0; i < PBAR_WIDTH; i++) {
+                if (i < fill) {
+                    /* Head cell: bright plum; tail: medium violet */
+                    if (i == fill - 1)
+                        fprintf(stderr, "%s\xe2\x96\x88%s", C_PLUM, C_RESET);
+                    else
+                        fprintf(stderr, "%s\xe2\x96\x88%s", C_VIOLET, C_RESET);
+                } else if (i == fill) {
+                    /* Glow bleed: half-block right after head */
+                    fprintf(stderr, "%s\xe2\x96\x8c%s", C_GRAPE, C_RESET);
+                } else {
+                    fprintf(stderr, "%s\xe2\x96\x91%s", C_GRAPE, C_RESET);
+                }
             }
+            fprintf(stderr, "] %s%3u%%%s  %u/%u  %s%.1f c/s%s   ",
+                    C_PLUM, pct, C_RESET,
+                    done, p->total,
+                    C_GREY, speed, C_RESET);
+        } else {
+            fprintf(stderr, "\r  %s [", p->label);
+            for (uint32_t i = 0; i < PBAR_WIDTH; i++) {
+                if (i < fill) { fputc(0xE2,stderr);fputc(0x96,stderr);fputc(0x88,stderr); }
+                else          { fputc(0xE2,stderr);fputc(0x96,stderr);fputc(0x91,stderr); }
+            }
+            fprintf(stderr, "] %3u%%  %u/%u  %.1f c/s   ",
+                    pct, done, p->total, speed);
         }
-        fprintf(stderr, "] %3u%%  %u/%u  %.1f c/s   ",
-                pct, done, p->total, speed);
         fflush(stderr);
     } else {
-        /* Non-TTY: only print at 25% milestones */
         if (pct % 25 == 0 && pct != 100)
             fprintf(stderr, "  %s: %u%%  (%u/%u chunks)\n",
                     p->label, pct, done, p->total);
@@ -8715,17 +8895,29 @@ static void __attribute__((unused)) progress_done(progress_t *p, bool ok)
 {
     uint64_t elapsed_ms = (mpcp_now_ns() - p->start_ns) / 1000000u;
     if (p->is_tty) {
-        /* Fill bar completely on success */
         if (ok) {
-            fprintf(stderr, "\r  %s [", p->label);
-            for (uint32_t i = 0; i < PBAR_WIDTH; i++) {
-                fputc(0xE2, stderr); fputc(0x96, stderr); fputc(0x88, stderr);
+            if (g_ui_colour) {
+                fprintf(stderr, "\r  %s%s%s [", C_GREY, p->label, C_RESET);
+                for (uint32_t i = 0; i < PBAR_WIDTH; i++)
+                    fprintf(stderr, "%s\xe2\x96\x88%s", C_LIME, C_RESET);
+                fprintf(stderr, "] %s100%%%s  %u/%u  %s%.2fs%s   \n",
+                        C_LIME, C_RESET, p->total, p->total,
+                        C_GREY, (double)elapsed_ms/1000.0, C_RESET);
+            } else {
+                fprintf(stderr, "\r  %s [", p->label);
+                for (uint32_t i = 0; i < PBAR_WIDTH; i++)
+                { fputc(0xE2,stderr);fputc(0x96,stderr);fputc(0x88,stderr); }
+                fprintf(stderr, "] 100%%  %u/%u  %.2fs   \n",
+                        p->total, p->total, (double)elapsed_ms / 1000.0);
             }
-            fprintf(stderr, "] 100%%  %u/%u  %.2fs   \n",
-                    p->total, p->total, (double)elapsed_ms / 1000.0);
         } else {
-            fprintf(stderr, "\r  %s [FAILED]  after %.2fs\n",
-                    p->label, (double)elapsed_ms / 1000.0);
+            if (g_ui_colour)
+                fprintf(stderr, "\r  %s%s%s %s[FAILED]%s  after %.2fs\n",
+                        C_GREY, p->label, C_RESET,
+                        C_ROSE, C_RESET, (double)elapsed_ms/1000.0);
+            else
+                fprintf(stderr, "\r  %s [FAILED]  after %.2fs\n",
+                        p->label, (double)elapsed_ms / 1000.0);
         }
     } else {
         fprintf(stderr, "  %s: %s  (%.2fs)\n",
@@ -8733,6 +8925,10 @@ static void __attribute__((unused)) progress_done(progress_t *p, bool ok)
     }
     fflush(stderr);
 }
+
+/* Progress polling thread
+}
+
 
 /* Progress polling thread - polls atomic counter and redraws bar */
 typedef struct {
@@ -8837,7 +9033,10 @@ static mpcp_contact_t *contact_find(const char *alias)
 
 static int read_line(const char *prompt, char *buf, size_t size)
 {
-    printf("%s", prompt);
+    if (g_ui_colour)
+        printf("  %s" GLYPH_ARR " %s%s%s ", C_GRAPE, C_VIOLET, prompt, C_RESET);
+    else
+        printf("%s", prompt);
     fflush(stdout);
     if (!fgets(buf, (int)size, stdin)) return -1;
     buf[strcspn(buf, "\n")] = '\0';
@@ -8846,7 +9045,10 @@ static int read_line(const char *prompt, char *buf, size_t size)
 
 static __attribute__((unused)) int read_line_noecho(const char *prompt, char *buf, size_t size)
 {
-    printf("%s", prompt);
+    if (g_ui_colour)
+        printf("  %s" GLYPH_LOCK " %s%s%s ", C_GRAPE, C_VIOLET, prompt, C_RESET);
+    else
+        printf("%s", prompt);
     fflush(stdout);
     struct termios old, noecho;
     tcgetattr(STDIN_FILENO, &old);
@@ -8862,7 +9064,12 @@ static __attribute__((unused)) int read_line_noecho(const char *prompt, char *bu
 static bool ask_yn(const char *question, bool default_yes)
 {
     char buf[8];
-    printf("%s [%s] ", question, default_yes ? "Y/n" : "y/N");
+    if (g_ui_colour)
+        printf("  %s%s%s [%s%s%s] ",
+               C_WHITE, question, C_RESET,
+               C_PLUM, default_yes ? "Y/n" : "y/N", C_RESET);
+    else
+        printf("%s [%s] ", question, default_yes ? "Y/n" : "y/N");
     fflush(stdout);
     if (!fgets(buf, sizeof(buf), stdin)) return default_yes;
     buf[strcspn(buf, "\n")] = '\0';
@@ -8872,11 +9079,29 @@ static bool ask_yn(const char *question, bool default_yes)
 
 static void banner(const char *title)
 {
-    printf("\n:: %s ", title);
-    int len = 3 + (int)strlen(title) + 1;
-    for (int i = len; i < 60; i++) putchar('-');
-    printf("\n");
+    if (g_ui_colour) {
+        /* Animated: draw left corner, title, then rule character by character */
+        printf("\n  %s\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80%s %s" GLYPH_GEM " %s%s%s%s ",
+               C_GRAPE, C_RESET, C_PLUM, C_BOLD, title, C_RESET, C_RESET);
+        int used = 9 + (int)strlen(title);
+        printf("%s", C_GRAPE);
+        for (int i = used; i < 60; i++) {
+            printf("\xe2\x94\x80");
+            fflush(stdout);
+        }
+        printf("\xe2\x94\x90%s\n", C_RESET);
+    } else {
+        printf("\n-- %s ", title);
+        int len = 4 + (int)strlen(title);
+        for (int i = len; i < 60; i++) putchar('-');
+        printf("\n");
+    }
 }
+
+
+/* ===
+}
+
 
 
 /* =========================================================
@@ -8900,21 +9125,46 @@ typedef struct {
 static void *spinner_thread(void *arg)
 {
     spinner_t *sp = (spinner_t *)arg;
-    const char frames[] = { '|', '/', '-', '\\' };
+    /* Braille 10-frame dot spinner */
+    static const char *bf[] = {
+        "\xe2\xa0\x8b","\xe2\xa0\x99","\xe2\xa0\xb9","\xe2\xa0\xb8",
+        "\xe2\xa0\xbc","\xe2\xa0\xb4","\xe2\xa0\xa6","\xe2\xa0\xa7",
+        "\xe2\xa0\x87","\xe2\xa0\x8f",
+    };
+    /* Colour cycles through purple shades to create glow effect */
+    static const char *gcols[] = {
+        "\033[38;2;160;80;220m",
+        "\033[38;2;180;100;240m",
+        "\033[38;2;200;130;255m",
+        "\033[38;2;220;160;255m",
+        "\033[38;2;200;130;255m",
+        "\033[38;2;180;100;240m",
+    };
+    static const char pf[] = { '|', '/', '-', '\\' };
     int idx = 0;
     while (!sp->done) {
-        printf("\r  %c", frames[idx++ & 3]);
+        if (g_ui_colour)
+            printf("\r  %s%s%s ", gcols[idx % 6], bf[idx % 10], C_RESET);
+        else
+            printf("\r  %c ", pf[idx & 3]);
         fflush(stdout);
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 80000000L }; /* 80ms */
+        idx++;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 70000000L };
         nanosleep(&ts, NULL);
     }
-    /* Print final status and clear the spinner character */
-    if (sp->done == 2)
-        printf("\r  done\n");
-    else if (sp->done == 3)
-        printf("\r  failed\n");
-    else
-        printf("\r  \n");
+    if (sp->done == 2) {
+        if (g_ui_colour)
+            printf("\r  %s" GLYPH_OK "%s  done          \n", C_LIME, C_RESET);
+        else
+            printf("\r  done          \n");
+    } else if (sp->done == 3) {
+        if (g_ui_colour)
+            printf("\r  %s" GLYPH_FAIL "%s  failed        \n", C_ROSE, C_RESET);
+        else
+            printf("\r  failed        \n");
+    } else {
+        printf("\r                  \n");
+    }
     fflush(stdout);
     return NULL;
 }
@@ -8922,7 +9172,10 @@ static void *spinner_thread(void *arg)
 static void spinner_start(spinner_t *sp, const char *label)
 {
     sp->done = 0;
-    printf("%s... ", label);
+    if (g_ui_colour)
+        printf("  %s%s%s\n", C_GREY, label, C_RESET);
+    else
+        printf("%s...\n", label);
     fflush(stdout);
     pthread_create(&sp->thread, NULL, spinner_thread, sp);
 }
@@ -8932,6 +9185,7 @@ static void spinner_stop(spinner_t *sp, bool ok)
     sp->done = ok ? 2 : 3;
     pthread_join(sp->thread, NULL);
 }
+
 
 /* =========================================================
  * Contact management prompts
@@ -10064,11 +10318,12 @@ static int run_transfer(void)
                             bool zstd_err = (ZSTD_isError(clen) != 0);
                             double ratio  = zstd_err ? 1.0 : (double)clen / (double)fsize;
                             bool   sc     = zstd_err || (ratio > 0.95);
-                            size_t csz    = sc ? fsize : clen;
                             if (sc) xfer_skip_flag = MPCP_FLAG_SKIP_COMPRESSION;
+                            /* Plan from fsize: sender_run always reads raw bytes
+                             * from the original file in file_size/n_chunks pieces. */
                             mpcp_chunk_plan_t plan;
                             memset(&plan, 0, sizeof(plan));
-                            if (mpcp_chunker_plan(csz, cfg.chunk_pad_size, sc, &plan) == MPCP_OK)
+                            if (mpcp_chunker_plan(fsize, cfg.chunk_pad_size, sc, &plan) == MPCP_OK)
                                 exact_chunks = plan.n_chunks;
                             free(tmp);
                         }
@@ -10271,28 +10526,49 @@ int main(int argc, char **argv)
 
     contacts_load();
 
-    printf("\n");
-    printf("  ███╗   ███╗██████╗  ██████╗██████╗  \n");
-    printf("  ████╗ ████║██╔══██╗██╔════╝██╔══██╗ \n");
-    printf("  ██╔████╔██║██████╔╝██║     ██████╔╝ \n");
-    printf("  ██║╚██╔╝██║██╔═══╝ ██║     ██╔═══╝  \n");
-    printf("  ██║ ╚═╝ ██║██║     ╚██████╗██║      \n");
-    printf("  ╚═╝     ╚═╝╚═╝      ╚═════╝╚═╝      \n");
-    printf("  Multi-Port Catch Protocol  v0.5\n");
-    printf("\n");
+    ui_colour_init();
+    ui_print_logo();
 
     for (;;) {
-        printf("\n  1) Send / Receive a file\n");
-        printf("  2) Manage contacts\n");
-        printf("  3) Run self-test (loopback)\n");
-        printf("  4) Benchmark (loopback throughput)\n");
-        printf("  q) Quit\n");
+        if (g_ui_colour) {
+            printf("  %s┌─────────────────────────┐%s\n",
+                   C_GRAPE, C_RESET);
+            printf("  %s│%s  %s" GLYPH_STAR " MENU " GLYPH_STAR "%s"
+                   "                  %s│%s\n",
+                   C_GRAPE,C_RESET, C_PLUM,C_RESET, C_GRAPE,C_RESET);
+            printf("  %s├─────────────────────────┤%s\n",
+                   C_GRAPE, C_RESET);
+            printf("  %s│%s  %s1%s  " GLYPH_BOLT "  Send / Receive a file"
+                   "   %s│%s\n", C_GRAPE,C_RESET, C_PLUM,C_RESET, C_GRAPE,C_RESET);
+            printf("  %s│%s  %s2%s  " GLYPH_STAR "  Manage contacts"
+                   "         %s│%s\n", C_GRAPE,C_RESET, C_PLUM,C_RESET, C_GRAPE,C_RESET);
+            printf("  %s│%s  %s3%s  " GLYPH_WAVE "  Run self-test"
+                   "            %s│%s\n", C_GRAPE,C_RESET, C_PLUM,C_RESET, C_GRAPE,C_RESET);
+            printf("  %s│%s  %s4%s  " GLYPH_GEM "  Benchmark"
+                   "                %s│%s\n", C_GRAPE,C_RESET, C_PLUM,C_RESET, C_GRAPE,C_RESET);
+            printf("  %s│%s  %sq%s     Quit"
+                   "                    %s│%s\n", C_GRAPE,C_RESET, C_VIOLET,C_RESET, C_GRAPE,C_RESET);
+            printf("  %s└─────────────────────────┘%s\n\n",
+                   C_GRAPE, C_RESET);
+        } else {
+            printf("\n  1) Send / Receive a file\n");
+            printf("  2) Manage contacts\n");
+            printf("  3) Run self-test (loopback)\n");
+            printf("  4) Benchmark (loopback throughput)\n");
+            printf("  q) Quit\n\n");
+        }
+
         char buf[8];
-        read_line("\nChoice: ", buf, sizeof(buf));
+        read_line("Choice", buf, sizeof(buf));
 
         if (buf[0] == '1') {
             int rc = run_transfer();
-            if (rc != 0) printf("\n  Session ended with errors.\n");
+            if (rc != 0) {
+                if (g_ui_colour)
+                    printf("\n  %s" GLYPH_FAIL " Session ended with errors.%s\n", C_ROSE, C_RESET);
+                else
+                    printf("\n  Session ended with errors.\n");
+            }
         } else if (buf[0] == '2') {
             cmd_contacts();
         } else if (buf[0] == '3') {
@@ -10300,10 +10576,16 @@ int main(int argc, char **argv)
         } else if (buf[0] == '4') {
             run_bench();
         } else if (buf[0] == 'q' || buf[0] == 'Q') {
-            printf("Bye.\n");
+            if (g_ui_colour)
+                printf("\n  %s" GLYPH_GEM " Bye.%s\n\n", C_VIOLET, C_RESET);
+            else
+                printf("Bye.\n");
             return 0;
         } else {
-            printf("  Unknown option.\n");
+            if (g_ui_colour)
+                printf("  %sUnknown option.%s\n", C_GREY, C_RESET);
+            else
+                printf("  Unknown option.\n");
         }
     }
 }
