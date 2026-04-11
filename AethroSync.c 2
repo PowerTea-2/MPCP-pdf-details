@@ -27,6 +27,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdalign.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -216,7 +217,7 @@ extern const char *mpcp_strerror(mpcp_err_t err);
 #define MPCP_BOUNCE_PKT_LEN      58u
 #define MPCP_CHUNK_OVERHEAD      (4+1+1+4+24+8+16)
 #define MPCP_DATA_HDR_OFFSET     48u
-#define MAX_BLOCK_CHUNKS         256u
+#define MAX_BLOCK_CHUNKS         4096u
 #define MPCP_TYPE_PING           0x01
 #define MPCP_TYPE_PONG           0x02
 #define MPCP_TYPE_KEY_EXCHANGE   0x03
@@ -317,6 +318,213 @@ double baseline_mean;
 double baseline_std;  
 uint32_t sample_count;
 } mpcp_rtt_result_t;
+
+/* ---------------------------------------------------------------------------
+ * q32_t  —  signed Q16.16 fixed-point scalar (FPU-free Kalman arithmetic)
+ *
+ *   Bit layout:  [31..16] integer part  |  [15..0] fractional part
+ *   Range:       ±32767.99998...
+ *   Resolution:  ~1.526e-5  (1/65536)
+ * --------------------------------------------------------------------------*/
+typedef int32_t q32_t;
+
+#define Q32_FROM_INT(x)  ((q32_t)((int32_t)(x) << 16))
+#define Q32_ONE          Q32_FROM_INT(1)
+#define Q32_MUL(a, b)   ((q32_t)(((int64_t)(a) * (int64_t)(b)) >> 16))
+#define Q32_DIV(a, b)   ((q32_t)(((int64_t)(a) << 16) / (int64_t)(b)))
+
+/* ---------------------------------------------------------------------------
+ * mpcp_sliding_window_t — 64-bit Selective-Repeat sliding window
+ *
+ * Memory layout — four 64-byte cache lines, zero cross-line false sharing:
+ *
+ *   Line 0  [  0.. 63]  Sender-private hot path  (send thread only)
+ *   Line 1  [ 64..127]  ACK-receiver hot path    (ACK thread only)
+ *   Line 2  [128..191]  Shared atomics            (both threads, RMW)
+ *   Line 3  [192..255]  Kalman filter state       (send thread only)
+ * --------------------------------------------------------------------------*/
+typedef struct mpcp_sliding_window {
+
+    /* -----------------------------------------------------------------------
+     * LINE 0 — Sender-private hot path                              [0..63]
+     * Written exclusively by the send thread; ACK thread NEVER touches these.
+     * ----------------------------------------------------------------------- */
+    alignas(64)
+
+    /** Sequence number of the oldest unacknowledged segment (SND.UNA). */
+    uint64_t    send_base;
+
+    /** Next sequence number to assign to an outgoing segment (SND.NXT). */
+    uint64_t    send_next;
+
+    /** Negotiated receive-window advertisement (in segments). */
+    uint64_t    window_size;
+
+    /** Number of segments currently in-flight (sent, not yet ACK'd). */
+    uint64_t    inflight;
+
+    /** Monotonic timestamp (ns) of the most recent segment transmission. */
+    uint64_t    last_send_ns;
+
+    /** Current retransmission timeout in nanoseconds (updated by Kalman). */
+    uint64_t    retx_timeout_ns;
+
+    /** Token-bucket: remaining send credits in bytes (rate limiter). */
+    int64_t     token_bucket_credits;
+
+    /** Token refill rate in bytes-per-nanosecond (Q32 fixed-point). */
+    q32_t       token_refill_rate;
+
+    uint8_t     _pad0[4];
+
+    /* -----------------------------------------------------------------------
+     * LINE 1 — ACK-receiver hot path                              [64..127]
+     * Written exclusively by the ACK thread; send thread NEVER touches these.
+     * ----------------------------------------------------------------------- */
+    alignas(64)
+
+    /** Cumulative ACK number: all seqnos below this are confirmed received. */
+    uint64_t    recv_base;
+
+    /** Highest sequence number seen + 1 (RCV.NXT equivalent). */
+    uint64_t    recv_next;
+
+    /**
+     * Selective-ACK bitmask pointer.
+     *
+     * Bit  k  in ack_mask[]  corresponds to sequence number (recv_base + k).
+     * A set bit indicates the segment has been received out-of-order.
+     * Allocated externally; length = ceil(window_size / 8) bytes.
+     */
+    uint8_t    *ack_mask;
+
+    /** Length of the ack_mask allocation in bytes. */
+    uint64_t    ack_mask_len;
+
+    /** Monotonic timestamp (ns) of the most recently processed ACK. */
+    uint64_t    last_ack_ns;
+
+    /** Duplicate-ACK counter (fast-retransmit trigger at threshold 3). */
+    uint32_t    dup_ack_count;
+
+    /** Highest SACK block right-edge seen this RTT (for reorder detection). */
+    uint32_t    sack_high_water;
+
+    uint8_t     _pad1[8];
+
+    /* -----------------------------------------------------------------------
+     * LINE 2 — Shared atomics (both threads perform RMW here)    [128..191]
+     * All fields are _Atomic; MESI thrash is contained to this one line,
+     * and never invalidates the private lines above.
+     * ----------------------------------------------------------------------- */
+    alignas(64)
+
+    /**
+     * ACK'd base published by the ACK thread; consumed by the send thread
+     * to advance send_base and release window credits.
+     * Ordering: ACK thread release-stores; send thread acquire-loads.
+     */
+    _Atomic uint64_t    shared_ack_base;
+
+    /**
+     * Window credit advertisement written by ACK thread, read by send thread.
+     * Represents the receiver's current advertised window in segments.
+     */
+    _Atomic uint64_t    shared_window_adv;
+
+    /**
+     * Packed protocol state machine + control flags.
+     *
+     * Bits [7..0]   : connection state  (CLOSED/SLOW_START/CONG_AVOID/…)
+     * Bits [15..8]  : event flags       (FLAG_FAST_RETX | FLAG_ECN | …)
+     * Bits [31..16] : reserved
+     */
+    _Atomic uint32_t    state_flags;
+
+    /**
+     * Measured raw RTT sample in nanoseconds, published by the ACK thread
+     * after each timestamped echo, consumed by the Kalman update on the
+     * send thread.
+     */
+    _Atomic uint64_t    rtt_sample_ns;
+
+    /**
+     * Generation counter for seqlock-style window resets.
+     * Odd  → reset in progress (send thread must pause).
+     * Even → stable.
+     */
+    _Atomic uint32_t    generation;
+
+    /* 4 bytes compiler padding before rtt_sample_ns (8-byte align) plus
+     * 24 bytes before kf_rtt_estimate (alignas(64)) = 28 bytes total.
+     * Declaring them all explicitly removes every invisible compiler gap. */
+    uint8_t             _pad2[28];
+
+    /* -----------------------------------------------------------------------
+     * LINE 3 — 1-D Kalman filter state (RTT estimator)          [192..255]
+     *
+     * All quantities are Q16.16 fixed-point (q32_t), units = milliseconds.
+     * ms keeps every value inside the ±32767 integer range of Q16.16:
+     *   min RTT  ≈ 0.001 ms  (fits; Q16.16 resolution ≈ 1.5e-5)
+     *   max RTO  ≈ 30 000 ms (30 s — well below INT32_MAX/65536 ≈ 32767)
+     *
+     *   Predict:  x̂⁻ = x̂               (constant-velocity model, F = 1)
+     *             P⁻  = P + Q
+     *
+     *   Update:   K   = P⁻ / (P⁻ + R)
+     *             x̂  = x̂⁻ + K · (z − x̂⁻)
+     *             P   = (1 − K) · P⁻
+     *
+     * Kept on a private cache line so the update loop runs with zero
+     * cross-thread coherence traffic.
+     * ----------------------------------------------------------------------- */
+    alignas(64)
+
+    /** x̂  — posterior state estimate: smoothed RTT in ms (Q16.16). */
+    q32_t   kf_rtt_estimate;
+
+    /** P   — posterior error covariance (dimensionless ratio, Q16.16). */
+    q32_t   kf_error_cov;
+
+    /** Q   — process noise covariance: models RTT drift (Q16.16). */
+    q32_t   kf_process_noise;
+
+    /** R   — measurement noise covariance: models timestamp jitter (Q16.16). */
+    q32_t   kf_meas_noise;
+
+    /** K   — Kalman gain from the most recent update step (Q16.16). */
+    q32_t   kf_gain;
+
+    /** Innovation z − x̂⁻ from the most recent measurement (Q16.16, ms). */
+    q32_t   kf_innovation;
+
+    /**
+     * σ²_rtt — smoothed RTT variance used to set retx_timeout_ns:
+     *   RTO = x̂ + 4·√(σ²_rtt)   (mirrors RFC 6298 with fixed-point sqrt).
+     */
+    q32_t   kf_rtt_variance;
+
+    /**
+     * Minimum RTT ever observed (Q16.16, ms).
+     * Lower-bound sanity clamp on x̂ to resist ACK compression.
+     */
+    q32_t   kf_rtt_min;
+
+    /** Number of Kalman update cycles executed (diagnostics / warm-up guard). */
+    uint64_t    kf_update_count;
+
+    uint8_t     _pad3[24];
+
+} mpcp_sliding_window_t;
+
+_Static_assert(sizeof(mpcp_sliding_window_t) == 256,
+               "mpcp_sliding_window_t must be exactly 256 bytes (4 cache lines)");
+_Static_assert(alignof(mpcp_sliding_window_t) == 64,
+               "mpcp_sliding_window_t must be 64-byte aligned");
+_Static_assert(offsetof(mpcp_sliding_window_t, recv_base)       ==  64, "LINE 1 drift");
+_Static_assert(offsetof(mpcp_sliding_window_t, shared_ack_base) == 128, "LINE 2 drift");
+_Static_assert(offsetof(mpcp_sliding_window_t, kf_rtt_estimate) == 192, "LINE 3 drift");
+
 typedef struct __attribute__((packed)) {
 uint32_t magic;  
 uint8_t  version;  
@@ -340,8 +548,9 @@ uint8_t    padding[16];
 typedef struct __attribute__((packed)) {
 mpcp_hdr_t hdr;
 uint32_t   ack_seq;
-uint32_t   ack_hash;  
-uint8_t    padding[18];
+uint32_t   ack_hash;
+uint64_t   sack_bitmap;  /* bit k set = seq (ack_seq+1+k) received */
+uint8_t    padding[10];  /* 6+4+4+8+10 = 32 bytes */
 } mpcp_ack_pkt_t;
 typedef struct __attribute__((packed)) {
 mpcp_hdr_t hdr;
@@ -642,7 +851,7 @@ uint32_t                  ghost_seqs[64];
 uint32_t                  ghost_count;
 _Atomic(uint32_t)         acks_received;
 mpcp_dedup_t              ack_dedup;
-_Atomic(uint32_t)         retry_queue[256];
+_Atomic(uint32_t)         retry_queue[MAX_BLOCK_CHUNKS];
 _Atomic(uint32_t)         retry_head;
 _Atomic(uint32_t)         retry_tail;
 uint8_t                 **retry_cache;  
@@ -660,6 +869,9 @@ uint32_t                  block_size;
 uint32_t                  block_ghost_start;
 uint32_t                  block_ghost_end;
 mpcp_tripwire_t           tripwire;
+/* Selective-Repeat sliding window — cache-line aligned, Kalman RTT,
+   SACK bitmask, lock-free shared atomics.  See mpcp_sliding_window_t. */
+alignas(64) mpcp_sliding_window_t sw;
 } mpcp_sender_ctx_t;
 typedef struct {
 const mpcp_config_t      *cfg;
@@ -1119,7 +1331,7 @@ return rc;
   cfg->zerocopy           = true;
   cfg->batch_syscalls     = true;
   cfg->tripwire           = true;
-  cfg->tripwire_z_threshold = 3.5;
+  cfg->tripwire_z_threshold = 5.0;
   cfg->tripwire_window    = 5;
   cfg->tripwire_chi_pvalue= 0.05;
   {
@@ -1933,7 +2145,7 @@ result_out->median_rtt    = _median;
 result_out->trimmed_mean  = _median;
 result_out->ewma_rtt      = _median;
 result_out->sample_count  = (uint32_t)_mid_count;
-double _mad_vals[64];
+double _mad_vals[64] = {0};
 for (size_t _mi = _lo; _mi < _hi; _mi++)
 _mad_vals[_mi - _lo] = fabs(sorted[_mi] - _median);
 for (size_t _si = 1; _si < _mid_count; _si++) {
@@ -3784,6 +3996,207 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   sizeof(*peer));
   return (sent > 0) ? MPCP_OK : MPCP_ERR_IO;
   }
+/* =========================================================================
+ * mpcp_sliding_window_t — helper functions
+ *
+ * Threading contract (mirrors the struct layout comments):
+ *   mpcp_sw_init / mpcp_sw_destroy — called only from mpcp_sender_run(),
+ *     single-threaded before any thread is spawned / after all are joined.
+ *   mpcp_sw_kalman_update / mpcp_sw_advance_send_base — send thread only.
+ *   mpcp_sw_ack_bit_set / mpcp_sw_ack_bit_test — ACK thread only.
+ * ========================================================================= */
+
+/* -------------------------------------------------------------------------
+ * mpcp_sw_init — zero and initialise all four cache lines.
+ *   window_size : maximum segments in flight (in chunks)
+ *   rto_ns      : initial retransmission timeout in nanoseconds
+ * Returns MPCP_OK or MPCP_ERR_ALLOC.
+ * ---------------------------------------------------------------------- */
+static int mpcp_sw_init(mpcp_sliding_window_t *sw,
+                        uint32_t               window_size,
+                        uint64_t               rto_ns)
+{
+    memset(sw, 0, sizeof(*sw));
+
+    /* LINE 0 — sender-private */
+    sw->window_size          = (uint64_t)window_size;
+    sw->retx_timeout_ns      = rto_ns;
+    sw->token_bucket_credits = (int64_t)window_size;
+    sw->token_refill_rate    = Q32_FROM_INT(1); /* placeholder: 1 unit/ns */
+
+    /* LINE 1 — ACK-private: allocate SACK bitmask */
+    size_t mask_bytes = ((size_t)window_size + 7u) / 8u;
+    if (mask_bytes == 0u) mask_bytes = 1u;
+    sw->ack_mask = calloc(mask_bytes, 1u);
+    if (!sw->ack_mask) return MPCP_ERR_ALLOC;
+    sw->ack_mask_len = (uint64_t)mask_bytes;
+
+    /* LINE 2 — shared atomics */
+    atomic_store_explicit(&sw->shared_ack_base,   0u,
+                          memory_order_relaxed);
+    atomic_store_explicit(&sw->shared_window_adv, (uint64_t)window_size,
+                          memory_order_relaxed);
+    atomic_store_explicit(&sw->state_flags,        0u,
+                          memory_order_relaxed);
+    atomic_store_explicit(&sw->rtt_sample_ns,      0u,
+                          memory_order_relaxed);
+    atomic_store_explicit(&sw->generation,         0u,
+                          memory_order_relaxed);
+
+    /* LINE 3 — Kalman: seed estimate at half the initial RTO (µs, Q16.16).
+     * P₀ = 100 µs² (high initial uncertainty), Q = 1, R = 10. */
+    int32_t seed_ms  = (int32_t)(rto_ns / 2000000u);  /* ns→ms, halved */
+    if (seed_ms < 1)     seed_ms = 1;
+    if (seed_ms > 30000) seed_ms = 30000;
+    sw->kf_rtt_estimate  = Q32_FROM_INT(seed_ms);
+    sw->kf_rtt_min       = sw->kf_rtt_estimate;
+    sw->kf_error_cov     = Q32_FROM_INT(100);
+    sw->kf_process_noise = Q32_FROM_INT(1);
+    sw->kf_meas_noise    = Q32_FROM_INT(10);
+    sw->kf_rtt_variance  = Q32_FROM_INT(100);
+    sw->kf_update_count  = 0u;
+
+    return MPCP_OK;
+}
+
+/* -------------------------------------------------------------------------
+ * mpcp_sw_destroy — release resources owned by the struct.
+ * ---------------------------------------------------------------------- */
+static void mpcp_sw_destroy(mpcp_sliding_window_t *sw)
+{
+    free(sw->ack_mask);
+    sw->ack_mask     = NULL;
+    sw->ack_mask_len = 0u;
+}
+
+/* -------------------------------------------------------------------------
+ * mpcp_sw_kalman_update — FPU-free 1-D Kalman predict → update → RTO.
+ *
+ * Consumes the RTT sample published by the ACK thread via rtt_sample_ns
+ * (acquire-load), resets the atomic to zero, then runs:
+ *
+ *   Predict:  x̂⁻ = x̂,  P⁻ = P + Q
+ *   Update:   K   = P⁻/(P⁻+R),  x̂ += K·(z−x̂⁻),  P = (1−K)·P⁻
+ *   Variance: σ² = (1−K)·σ² + K·(z−x̂⁻)²
+ *   RTO:      RTO_µs = x̂ + 4·√σ²    (RFC 6298 analogue)
+ *
+ * All arithmetic is Q16.16 fixed-point (q32_t). √σ² is approximated with
+ * three Newton-Raphson iterations on the raw int32 value.
+ * ---------------------------------------------------------------------- */
+static void mpcp_sw_kalman_update(mpcp_sliding_window_t *sw)
+{
+    /* Acquire-load: pairs with the release-store in thread_ack_handler. */
+    uint64_t sample_ns = atomic_load_explicit(&sw->rtt_sample_ns,
+                                              memory_order_acquire);
+    if (sample_ns == 0u) return;
+
+    /* Consume: reset before computing so a concurrent ACK can post a new one */
+    atomic_store_explicit(&sw->rtt_sample_ns, 0u, memory_order_relaxed);
+
+    /* ns → ms, clamp to [1, 30 000] ms then convert to Q16.16 */
+    int32_t z_ms = (int32_t)(sample_ns / 1000000u);
+    if (z_ms < 1)     z_ms = 1;
+    if (z_ms > 30000) z_ms = 30000;
+    q32_t z = Q32_FROM_INT(z_ms);
+
+    /* --- Predict --------------------------------------------------------- */
+    q32_t x_prior = sw->kf_rtt_estimate;   /* x̂⁻ = x̂  (F = 1) */
+    q32_t p_prior = sw->kf_error_cov + sw->kf_process_noise;  /* P⁻ = P + Q */
+
+    /* --- Update ---------------------------------------------------------- */
+    q32_t denom = p_prior + sw->kf_meas_noise;
+    q32_t K     = (denom != 0) ? Q32_DIV(p_prior, denom) : 0;
+    sw->kf_gain = K;
+
+    q32_t innov        = z - x_prior;
+    sw->kf_innovation  = innov;
+
+    sw->kf_rtt_estimate = x_prior + Q32_MUL(K, innov);
+    sw->kf_error_cov    = Q32_MUL(Q32_ONE - K, p_prior);
+
+    /* Running variance: σ² = (1−K)·σ² + K·innov² */
+    q32_t innov_sq      = Q32_MUL(innov, innov);
+    sw->kf_rtt_variance = Q32_MUL(Q32_ONE - K, sw->kf_rtt_variance)
+                        + Q32_MUL(K, innov_sq);
+
+    /* Track floor */
+    if (sw->kf_update_count == 0u ||
+        sw->kf_rtt_estimate < sw->kf_rtt_min)
+        sw->kf_rtt_min = sw->kf_rtt_estimate;
+
+    sw->kf_update_count++;
+
+    /* --- Derive RTO ------------------------------------------------------- *
+     * RTO_µs = x̂ + 4·σ,   σ = √(σ²)
+     *
+     * Fixed-point √: treat kf_rtt_variance as a Q16.16 number.
+     * We need σ in the same units as x̂ (Q16.16 µs).
+     *
+     * √(Q16.16) = √(raw / 65536) → σ_int_µs ≈ isqrt(raw) / 256.
+     * Newton–Raphson (3 iters) on the raw int32:
+     *   s_{n+1} = (s_n + raw/s_n) / 2
+     * --------------------------------------------------------------------- */
+    int32_t raw = (int32_t)sw->kf_rtt_variance;
+    if (raw < 1) raw = 1;
+    int32_t s   = (raw >> 8) | 1;           /* seed: rough ≈ sqrt(raw) */
+    s = (s + raw / s) / 2;
+    s = (s + raw / s) / 2;
+    s = (s + raw / s) / 2;
+    /* s ≈ sqrt(raw Q16.16 value); σ in Q16.16 µs = s (already scaled) */
+    q32_t sigma_q = (q32_t)s;
+
+    q32_t rto_q_ms = sw->kf_rtt_estimate + (q32_t)(4 * sigma_q);
+
+    /* Clamp: [1 ms, 30 000 ms (30 s)] */
+    if (rto_q_ms < Q32_FROM_INT(1))     rto_q_ms = Q32_FROM_INT(1);
+    if (rto_q_ms > Q32_FROM_INT(30000)) rto_q_ms = Q32_FROM_INT(30000);
+
+    /* Q16.16 ms → integer ns */
+    sw->retx_timeout_ns = (uint64_t)((int32_t)(rto_q_ms >> 16)) * 1000000u;
+}
+
+/* -------------------------------------------------------------------------
+ * SACK bitmask helpers (ACK thread only).
+ * ---------------------------------------------------------------------- */
+
+/* Mark seq as selectively-acknowledged in the SACK bitmask. */
+static void mpcp_sw_ack_bit_set(mpcp_sliding_window_t *sw, uint64_t seq)
+{
+    if (!sw->ack_mask) return;
+    uint64_t mask_bits = sw->ack_mask_len * 8u;
+    uint64_t off = seq & (mask_bits - 1u);
+    sw->ack_mask[off / 8u] |= (uint8_t)(1u << (off % 8u));
+}
+
+/* Return true if seq has already been marked in the SACK bitmask. */
+static bool mpcp_sw_ack_bit_test(const mpcp_sliding_window_t *sw, uint64_t seq)
+{
+    if (!sw->ack_mask) return false;
+    uint64_t mask_bits = sw->ack_mask_len * 8u;
+    uint64_t off = seq & (mask_bits - 1u);
+    return (sw->ack_mask[off / 8u] & (uint8_t)(1u << (off % 8u))) != 0u;
+}
+
+/* -------------------------------------------------------------------------
+ * mpcp_sw_advance_send_base — send thread only.
+ *
+ * Advances send_base to new_base (which comes from an acquire-load of
+ * shared_ack_base), decrements inflight accordingly, and clears the SACK
+ * bitmask bits that have slid out of the window.
+ * ---------------------------------------------------------------------- */
+static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
+                                      uint64_t               new_base)
+{
+    if (new_base <= sw->send_base) return;
+    uint64_t delta = new_base - sw->send_base;
+    if (delta > sw->inflight) delta = sw->inflight;
+    sw->inflight -= delta;
+    sw->send_base = new_base;
+    /* ack_mask is ACK-thread-only — send thread must not touch it. */
+}
+
+/* ========================================================================= */
+
   static void *thread_sender(void *arg)
   {
   sender_arg_t      *a   = arg;
@@ -3824,7 +4237,43 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   MPCP_TYPE_DATA_CHUNK, 0,
   ctx->cfg->zerocopy);
   data_consumed++;
-  { uint32_t _local = (seq >= _block_base) ? (seq - _block_base) : 0;
+  /* --- sw: record send, advance base if ACK thread published progress --- */
+  mpcp_sliding_window_t *sw = &ctx->sw;
+  sw->send_next++;
+  sw->inflight++;
+  sw->last_send_ns = mpcp_now_ns();
+  /* Advance send_base from whatever shared_ack_base the ACK thread posted */
+  uint64_t acked_base = atomic_load_explicit(&sw->shared_ack_base,
+                                             memory_order_acquire);
+  if (acked_base > sw->send_base)
+      mpcp_sw_advance_send_base(sw, acked_base);
+  /* Run Kalman if the ACK thread deposited a new RTT sample */
+  if (atomic_load_explicit(&sw->rtt_sample_ns, memory_order_relaxed) != 0u)
+      mpcp_sw_kalman_update(sw);
+  /* Inflight window gate: spin until there is credit.
+   * retx_timeout_ns doubles as the gate spin limit — if we have been
+   * stalled longer than one RTO something has gone wrong; let the
+   * existing retry/abort path handle it. */
+  if (sw->inflight >= sw->window_size) {
+      uint64_t gate_deadline = sw->last_send_ns + sw->retx_timeout_ns;
+      sw->window_size = atomic_load_explicit(&sw->shared_window_adv, memory_order_acquire);
+      while (sw->inflight >= sw->window_size &&
+             !atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) {
+          if (mpcp_now_ns() > gate_deadline) {
+              atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
+              break;
+          }
+          struct timespec _ts = { .tv_sec = 0, .tv_nsec = 100000L }; /* 100 µs */
+          nanosleep(&_ts, NULL);
+          acked_base = atomic_load_explicit(&sw->shared_ack_base,
+                                            memory_order_acquire);
+          if (acked_base > sw->send_base)
+              mpcp_sw_advance_send_base(sw, acked_base);
+          if (atomic_load_explicit(&sw->rtt_sample_ns, memory_order_relaxed) != 0u)
+              mpcp_sw_kalman_update(sw);
+      }
+  }
+  { uint32_t _local = (seq >= _block_base) ? (seq - _block_base) : 0u;
   if (_local < _block_size && ctx->retry_cache && !ctx->retry_cache[_local]) {
   uint8_t *cached = malloc(slot->ct_len);
   if (cached) {
@@ -3849,7 +4298,7 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   uint16_t _p2;
   /* O(1) key derivation — no keystream heap */
   mpcp_get_chunk_params(ctx->sess, ctx->cfg, gseq, gkey, &_p2);
-  size_t  gct_len;
+  size_t  gct_len = 0;
   uint8_t gnonce[24];
   size_t  gbuf_sz = (size_t)ctx->cfg->chunk_pad_size + 16u;
   /* Stack allocation — max chunk_pad_size is 63488 B */
@@ -4021,6 +4470,45 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   uint32_t _local = ack_seq - _blk_base;
   atomic_fetch_add_explicit(&ctx->acks_received, 1u,
   memory_order_relaxed);
+  /* --- sw: SACK bitmask + RTT sample + shared base publish ------------- */
+  {
+  mpcp_sliding_window_t *sw = &ctx->sw;
+  /* Mark this seq as received in the SACK bitmask */
+  uint64_t seq64 = (uint64_t)ack_seq;
+  mpcp_sw_ack_bit_set(sw, seq64);
+  /* Advance recv_next */
+  if (seq64 + 1u > sw->recv_next) sw->recv_next = seq64 + 1u;
+  /* Capture hardware/software send timestamp for RTT if available */
+  uint64_t send_ts_ns = 0u;
+  if (_local < _blk_size && ctx->sent_time_ns)
+      send_ts_ns = ctx->sent_time_ns[_local];
+  if (send_ts_ns != 0u) {
+      uint64_t rtt_ns = mpcp_now_ns() - send_ts_ns;
+      /* Only publish if no sample is pending (don't overwrite un-consumed) */
+      uint64_t expected_zero = 0u;
+      /* CAS so we never clobber a sample the send thread hasn't consumed */
+      (void)atomic_compare_exchange_strong_explicit(
+          &sw->rtt_sample_ns,
+          &expected_zero, rtt_ns,
+          memory_order_release,
+          memory_order_relaxed);
+  }
+  /* Advance cumulative recv_base over consecutive received seqs.
+   * Clear each consumed bit so the modular slot is free for re-use. */
+  while (mpcp_sw_ack_bit_test(sw, sw->recv_base)) {
+      uint64_t _mb = sw->ack_mask_len * 8u;
+      uint64_t _of = sw->recv_base & (_mb - 1u);
+      sw->ack_mask[_of / 8u] &= (uint8_t)~(1u << (_of % 8u));
+      sw->recv_base++;
+  }
+  /* Publish to send thread (release-store; pairs with acquire-load there) */
+  atomic_store_explicit(&sw->shared_ack_base, sw->recv_base,
+                        memory_order_release);
+  atomic_store_explicit(&sw->shared_window_adv,
+                        sw->window_size,    /* echo current window */
+                        memory_order_relaxed);
+  }
+  /* -------------------------------------------------------------------- */
   /* Clear retry_cache: sentinel that retry phase uses to confirm ACK */
   if (_local < _blk_size && ctx->retry_cache && ctx->retry_cache[_local]) {
   sodium_memzero(ctx->retry_cache[_local], ctx->retry_cache_lens[_local]);
@@ -4109,14 +4597,14 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   atomic_store_explicit(&ctx.t1_done,    false, memory_order_relaxed);
   atomic_store_explicit(&ctx.t2_done,    false, memory_order_relaxed);
   mpcp_dedup_init(&ctx.ack_dedup);
-  /* BLOCK-SYNC: allocate caches at MAX_BLOCK_CHUNKS, reused each block (~16MB max) */
-  ctx.retry_cache      = calloc(MAX_BLOCK_CHUNKS, sizeof(uint8_t *));
-  ctx.retry_cache_lens = calloc(MAX_BLOCK_CHUNKS, sizeof(size_t));
-  ctx.retry_nonces     = calloc(MAX_BLOCK_CHUNKS, sizeof(*ctx.retry_nonces));
-  ctx.retry_data_lens  = calloc(MAX_BLOCK_CHUNKS, sizeof(uint32_t));
-  ctx.retry_flags      = calloc(MAX_BLOCK_CHUNKS, sizeof(uint8_t));
-  ctx.sent_flag        = calloc(MAX_BLOCK_CHUNKS, sizeof(_Atomic(bool)));
-  ctx.sent_time_ns     = calloc(MAX_BLOCK_CHUNKS, sizeof(uint64_t));
+  uint32_t _total_file_chunks = plan.n_chunks;
+  ctx.retry_cache      = calloc(_total_file_chunks, sizeof(uint8_t *));
+  ctx.retry_cache_lens = calloc(_total_file_chunks, sizeof(size_t));
+  ctx.retry_nonces     = calloc(_total_file_chunks, sizeof(*ctx.retry_nonces));
+  ctx.retry_data_lens  = calloc(_total_file_chunks, sizeof(uint32_t));
+  ctx.retry_flags      = calloc(_total_file_chunks, sizeof(uint8_t));
+  ctx.sent_flag        = calloc(_total_file_chunks, sizeof(_Atomic(bool)));
+  ctx.sent_time_ns     = calloc(_total_file_chunks, sizeof(uint64_t));
   if (!ctx.retry_cache || !ctx.retry_cache_lens || !ctx.retry_nonces ||
   !ctx.retry_data_lens || !ctx.retry_flags ||
   !ctx.sent_flag || !ctx.sent_time_ns) {
@@ -4168,6 +4656,25 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   atomic_store_explicit(&ctx.t1_done,       false, memory_order_relaxed);
   atomic_store_explicit(&ctx.t2_done,       false, memory_order_relaxed);
   mpcp_dedup_init(&ctx.ack_dedup);
+  /* (Re-)initialise sliding window for this block.
+   * window_size = block size (all chunks in flight permitted),
+   * RTO seeded from config or inherited from previous block's Kalman. */
+  {
+  uint64_t init_rto_ns = (ctx.sw.retx_timeout_ns > 0u)
+                       ? ctx.sw.retx_timeout_ns
+                       : (uint64_t)(ctx.cfg->chunk_retry_timeout * 1e9);
+  mpcp_sw_destroy(&ctx.sw);
+  int sw_rc = mpcp_sw_init(&ctx.sw, _blk_sz, init_rto_ns);
+  if (sw_rc != MPCP_OK) {
+      atomic_store_explicit(&ctx.abort_flag, true, memory_order_relaxed);
+      break;
+  }
+  /* Anchor sequence numbers to absolute block base */
+  ctx.sw.send_base  = (uint64_t)_blk_base;
+  ctx.sw.send_next  = (uint64_t)_blk_base;
+  ctx.sw.recv_base  = (uint64_t)_blk_base;
+  ctx.sw.recv_next  = (uint64_t)_blk_base;
+  }
   /* Clear block-scoped retry cache from previous block */
   for (uint32_t _ci = 0; _ci < _blk_sz; _ci++) {
   if (ctx.retry_cache[_ci]) {
@@ -4208,8 +4715,9 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   else
   rc = MPCP_OK;
   /* keystream was O(1) on-the-fly — nothing to free */
+  mpcp_sw_destroy(&ctx.sw);
   if (ctx.retry_cache) {
-  for (uint32_t _i = 0; _i < MAX_BLOCK_CHUNKS; _i++) {
+  for (uint32_t _i = 0; _i < _total_file_chunks; _i++) {
   if (ctx.retry_cache[_i]) {
   sodium_memzero(ctx.retry_cache[_i], ctx.retry_cache_lens[_i]);
   free(ctx.retry_cache[_i]);
@@ -4295,7 +4803,8 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   cur_port = needed_port;
   }
   uint64_t t_arrival = blink_arrival_time(sess, seq);
-  const uint64_t GUARD_NS = 5000000ULL;
+  const uint64_t GUARD_NS = (sess->blink_interval_ns == 0)
+                          ? 50000000ULL : 5000000ULL;
   struct sockaddr_in from_addr;
   socklen_t          from_len = sizeof(from_addr);
   ssize_t nb = blink_recv_window(blink_fd, pkt, pkt_max,
@@ -4354,6 +4863,7 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   uint8_t ah[4];
   if (mpcp_ack_hash(sess->session_key, pkt_seq, ah) == MPCP_OK)
   memcpy(&ack.ack_hash, ah, 4);
+  ack.sack_bitmap = 0;
   randombytes_buf(ack.padding, sizeof(ack.padding));
   sendto(blink_fd, &ack, sizeof(ack), 0,
   (const struct sockaddr *)&from_addr, from_len);
@@ -4464,6 +4974,7 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   uint8_t ah2[4];
   if (mpcp_ack_hash(sess->session_key, ps2, ah2) == MPCP_OK)
   memcpy(&a2.ack_hash, ah2, 4);
+  a2.sack_bitmap = 0;
   randombytes_buf(a2.padding, sizeof(a2.padding));
   sendto(fds[i], &a2, sizeof(a2), 0,
   (const struct sockaddr *)&fsrc, fsl); }
@@ -5792,7 +6303,7 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   /* O(1) key derivation — no keystream heap */
   mpcp_get_chunk_params(&sess, &_acfg, 0, key0, &_p);
   mpcp_get_chunk_params(&sess, &_acfg, 1, key1, &_p);
-  size_t  ct0_len, ct1_len;
+  size_t  ct0_len = 0, ct1_len = 0;
   uint8_t ct0[272 + 16], ct1[272 + 16];
   uint8_t nonce0[24], nonce1[24];
   mpcp_chunk_encrypt(key0, sess.session_nonce, 0,
@@ -7644,6 +8155,10 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   struct stat _st;
   if (stat(file_buf, &_st) == 0 && _st.st_size > 0) {
   size_t fsize = (size_t)_st.st_size;
+  if (fsize > 4u * 1024u * 1024u && sess.blink_interval_ns > 0) {
+      sess.blink_interval_ns = 0;
+      printf("  [large file] Blink disabled \xe2\x80\x93 using normal UDP scheduling\n");
+  }
   static const size_t _PROBE_CAP_RT = 1u << 20;
   size_t _probe_rt = (fsize < _PROBE_CAP_RT) ? fsize : _PROBE_CAP_RT;
   size_t bound = ZSTD_compressBound(_probe_rt);
