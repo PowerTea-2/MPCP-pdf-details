@@ -609,6 +609,20 @@ ts.tv_sec  = (time_t)(target_ns / 1000000000ULL);
 ts.tv_nsec = (long)(target_ns % 1000000000ULL);
 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
 }
+static inline void mpcp_precise_wait_ns(uint64_t target_ns, uint64_t busy_wait_ns)
+{
+uint64_t now = mpcp_now_ns();
+if (target_ns > now + busy_wait_ns) {
+uint64_t sleep_until = target_ns - busy_wait_ns;
+struct timespec ts;
+ts.tv_sec  = (time_t)(sleep_until / 1000000000ULL);
+ts.tv_nsec = (long)(sleep_until % 1000000000ULL);
+(void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+}
+while ((now = mpcp_now_ns()) < target_ns) {
+__asm__ __volatile__("pause" ::: "memory");
+}
+}
 int mpcp_crypto_init(void);
 int mpcp_hkdf(const uint8_t *salt,  size_t salt_len,
 const uint8_t *ikm,   size_t ikm_len,
@@ -933,6 +947,7 @@ uint32_t                   n_chunks);
 static uint16_t blink_hop_port(const mpcp_session_t *sess,
 const mpcp_config_t  *cfg,
 uint32_t              chunk_idx);
+static int32_t schedule_jitter_ns(const mpcp_session_t *sess, uint32_t seq);
 static uint64_t blink_arrival_time(const mpcp_session_t *sess,
 uint32_t              chunk_idx);
 static ssize_t blink_recv_window(int fd, void *buf, size_t buf_len,
@@ -4408,8 +4423,13 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   return NULL;
   }
   bool use_blink_pacer = (ctx->sess->blink_interval_ns > 0);
-  uint64_t _origin_ns = ctx->sess->blink_origin_ns;
+  uint64_t _origin_ns = ctx->sess->t_zero_ns ? ctx->sess->t_zero_ns : ctx->sess->blink_origin_ns;
   uint64_t _blink_interval_ns = ctx->sess->blink_interval_ns;
+  double   _drift = (ctx->sess->drift_coefficient > 0.0) ? ctx->sess->drift_coefficient : 1.0;
+  double   _pid_i = 0.0;
+  double   _pid_c = 0.0;
+  const double _kp = 0.3;
+  const double _ki = 0.02;
   uint32_t _block_size = ctx->block_size;
   uint32_t _block_base = ctx->block_base;
   while (data_consumed < _block_size) {
@@ -4425,11 +4445,11 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   memcpy(&dest, ctx->peer_addr, sizeof(dest));
   dest.sin_port = htons(port);
   if (use_blink_pacer) {
-  uint64_t _abs_target = _origin_ns + ((uint64_t)seq * _blink_interval_ns);
-  struct timespec _abs_ts;
-  _abs_ts.tv_sec  = (time_t)(_abs_target / 1000000000ULL);
-  _abs_ts.tv_nsec = (long)(_abs_target % 1000000000ULL);
-  clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &_abs_ts, NULL);
+  double scaled = (double)seq * (double)_blink_interval_ns * _drift;
+  int64_t _abs_target_i = (int64_t)_origin_ns + (int64_t)scaled + (int64_t)_pid_c
+                        + (int64_t)schedule_jitter_ns(ctx->sess, seq);
+  uint64_t _abs_target = (_abs_target_i > 0) ? (uint64_t)_abs_target_i : _origin_ns;
+  mpcp_precise_wait_ns(_abs_target, 50000ULL);
   }
   (void)send_chunk_packet(persist_sock, &dest, ctx->sess, slot,
   MPCP_TYPE_DATA_CHUNK, 0,
@@ -4448,6 +4468,16 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   /* Run Kalman if the ACK thread deposited a new RTT sample */
   if (atomic_load_explicit(&sw->rtt_sample_ns, memory_order_relaxed) != 0u)
       mpcp_sw_kalman_update(sw);
+  if (use_blink_pacer) {
+      double kf_ms = (double)(int32_t)(sw->kf_rtt_estimate >> 16);
+      double err_ns = (kf_ms * 1000000.0) * 0.5;
+      _pid_i += err_ns;
+      if (_pid_i > 5000000.0) _pid_i = 5000000.0;
+      if (_pid_i < -5000000.0) _pid_i = -5000000.0;
+      _pid_c += (_kp * err_ns) + (_ki * _pid_i);
+      if (_pid_c > 5000000.0) _pid_c = 5000000.0;
+      if (_pid_c < -5000000.0) _pid_c = -5000000.0;
+  }
   /* Inflight window gate: spin until there is credit.
    * retx_timeout_ns doubles as the gate spin limit — if we have been
    * stalled longer than one RTO something has gone wrong; let the
