@@ -304,6 +304,7 @@ int64_t  clock_offset_ns;
 uint64_t blink_interval_ns;
 uint64_t blink_origin_ns;  
 uint64_t t_zero_ns;
+double   drift_coefficient;
 
 } mpcp_session_t;
 typedef struct {
@@ -2433,6 +2434,7 @@ sess->blink_interval_ns = 200000000ULL;
 const uint64_t ORIGIN_GUARD_NS = 1500000000ULL;
 sess->blink_origin_ns = mpcp_now_ns() + ORIGIN_GUARD_NS;
 sess->t_zero_ns = sess->blink_origin_ns;
+sess->drift_coefficient = 1.0;
 fprintf(stderr, "[blink] calibrated: interval=%.1fms  origin_in=%.0fms\n",
 (double)sess->blink_interval_ns / 1e6,
 (double)(int64_t)(sess->blink_origin_ns - mpcp_now_ns()) / 1e6);
@@ -4951,7 +4953,85 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   uint32_t chunk_index;
   uint64_t expected_arrival_ns;
   uint16_t ephemeral_port;
+  uint8_t  sub_index;
+  int32_t  jitter_ns;
   } schedule_entry_t;
+  static uint16_t blink_hop_port_subidx(const mpcp_session_t *sess,
+  const mpcp_config_t *cfg,
+  uint32_t chunk_idx,
+  uint8_t sub_index)
+  {
+  uint32_t hop_interval = (cfg->port_hop_interval > 0) ? cfg->port_hop_interval : 1u;
+  uint32_t hop_base     = (chunk_idx / hop_interval) * hop_interval;
+  uint8_t nonce_x[MPCP_SESSION_NONCE_LEN];
+  memcpy(nonce_x, sess->session_nonce, MPCP_SESSION_NONCE_LEN);
+  nonce_x[chunk_idx % MPCP_SESSION_NONCE_LEN] ^= sub_index;
+  uint8_t ikm[9 + 4 + MPCP_SESSION_NONCE_LEN];
+  memcpy(ikm, "blink-hop", 9);
+  ikm[9]  = (uint8_t)((hop_base >> 24) & 0xFF);
+  ikm[10] = (uint8_t)((hop_base >> 16) & 0xFF);
+  ikm[11] = (uint8_t)((hop_base >>  8) & 0xFF);
+  ikm[12] = (uint8_t)( hop_base        & 0xFF);
+  memcpy(ikm + 13, nonce_x, MPCP_SESSION_NONCE_LEN);
+  uint8_t out[4];
+  if (mpcp_hkdf(sess->session_key, MPCP_SESSION_KEY_LEN,
+  ikm, sizeof(ikm), "mpcp-v0.5-blink-hop", out, 4) != MPCP_OK) {
+  sodium_memzero(nonce_x, sizeof(nonce_x));
+  return blink_hop_port(sess, cfg, chunk_idx);
+  }
+  sodium_memzero(nonce_x, sizeof(nonce_x));
+  uint32_t seed = ((uint32_t)out[0] << 24) | ((uint32_t)out[1] << 16) |
+  ((uint32_t)out[2] <<  8) |  (uint32_t)out[3];
+  return (uint16_t)(seed % cfg->port_range + cfg->port_base);
+  }
+  static int32_t schedule_jitter_ns(const mpcp_session_t *sess, uint32_t seq)
+  {
+  uint8_t out[4];
+  uint8_t ikm[8];
+  ikm[0] = (uint8_t)(seq >> 24); ikm[1] = (uint8_t)(seq >> 16);
+  ikm[2] = (uint8_t)(seq >>  8); ikm[3] = (uint8_t)seq;
+  ikm[4] = 'j'; ikm[5] = 'i'; ikm[6] = 't'; ikm[7] = 'r';
+  if (mpcp_hkdf(sess->session_key, MPCP_SESSION_KEY_LEN,
+  ikm, sizeof(ikm), "mpcp-v0.5-heisenberg-jitter", out, 4) != MPCP_OK)
+  return 0;
+  uint32_t v = ((uint32_t)out[0] << 24) | ((uint32_t)out[1] << 16) |
+  ((uint32_t)out[2] << 8) | (uint32_t)out[3];
+  int32_t span = 100001; /* [-50000, +50000] ns */
+  return (int32_t)(v % (uint32_t)span) - 50000;
+  }
+  static void mpcp_generate_schedule(const mpcp_session_t *sess,
+  const mpcp_config_t *cfg,
+  const uint32_t *seqs,
+  uint32_t n,
+  uint64_t tzero_ns,
+  uint64_t interval_ns,
+  double drift_coefficient,
+  schedule_entry_t *out)
+  {
+  for (uint32_t i = 0; i < n; i++) {
+  uint32_t seq = seqs[i];
+  out[i].chunk_index = seq;
+  double scaled = (double)i * (double)interval_ns * drift_coefficient;
+  int64_t target = (int64_t)tzero_ns + (int64_t)scaled;
+  int32_t jit = schedule_jitter_ns(sess, seq);
+  out[i].jitter_ns = jit;
+  out[i].expected_arrival_ns = (target + jit > 0) ? (uint64_t)(target + jit) : tzero_ns;
+  uint8_t sub = 0;
+  uint16_t p = blink_hop_port_subidx(sess, cfg, seq, sub);
+  for (;;) {
+  bool collides = false;
+  uint32_t j0 = (i > 10u) ? (i - 10u) : 0u;
+  for (uint32_t j = j0; j < i; j++) {
+  if (out[j].ephemeral_port == p) { collides = true; break; }
+  }
+  if (!collides || sub == 255u) break;
+  sub++;
+  p = blink_hop_port_subidx(sess, cfg, seq, sub);
+  }
+  out[i].sub_index = sub;
+  out[i].ephemeral_port = p;
+  }
+  }
   static void sleep_until_raw_abs(uint64_t when_ns)
   {
   struct timespec ts;
@@ -4967,6 +5047,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   size_t ct_len,
   uint32_t data_len)
   {
+  static const uint8_t zero_nonce[24] = {0};
+  if (sodium_memcmp(nonce, zero_nonce, sizeof(zero_nonce)) == 0) return false;
   uint8_t chunk_key[32];
   uint16_t kp = 0;
   mpcp_get_chunk_params(sess, cfg, seq, chunk_key, &kp);
@@ -5002,6 +5084,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   uint64_t now_raw = mpcp_now_raw_ns();
   uint64_t tzero = sess->t_zero_ns ? sess->t_zero_ns : sess->blink_origin_ns;
   if (tzero == 0) tzero = now_raw + 1000000000ULL;
+  double drift = (sess->drift_coefficient > 0.0) ? sess->drift_coefficient : 1.0;
   schedule_entry_t *sched = calloc(n, sizeof(*sched));
   bool *got = calloc(n, sizeof(bool));
   if (!sched || !got) {
@@ -5009,12 +5092,12 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   atomic_store_explicit(&ctx->t1_done, true, memory_order_release);
   return NULL;
   }
-  for (uint32_t i = 0; i < n; i++) {
-  uint32_t seq = a->block_seqs[i];
-  sched[i].chunk_index = seq;
-  sched[i].expected_arrival_ns = tzero + (uint64_t)seq * sess->blink_interval_ns;
-  sched[i].ephemeral_port = blink_hop_port(sess, cfg, seq);
-  }
+  mpcp_generate_schedule(sess, cfg, a->block_seqs, n,
+  tzero, sess->blink_interval_ns, drift, sched);
+  double pid_integral_ns = 0.0;
+  double pid_correction_ns = 0.0;
+  const double Kp = 0.3;
+  const double Ki = 0.02;
   for (uint32_t i = 0; i < n; i++) {
   if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
   uint32_t seq = sched[i].chunk_index;
@@ -5022,7 +5105,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   for (uint32_t g = 0; g < ctx->ghost_count; g++) {
   if (ctx->ghost_seqs[g] == seq) { is_ghost = true; break; }
   }
-  uint64_t expected = sched[i].expected_arrival_ns;
+  int64_t expected_adj = (int64_t)sched[i].expected_arrival_ns + (int64_t)pid_correction_ns;
+  uint64_t expected = (expected_adj > 0) ? (uint64_t)expected_adj : sched[i].expected_arrival_ns;
   uint64_t open_at = (expected > 5000000ULL) ? expected - 5000000ULL : expected;
   if (mpcp_now_raw_ns() < open_at) sleep_until_raw_abs(open_at);
   int jit_fd = open_udp_socket_on_port(sched[i].ephemeral_port);
@@ -5056,6 +5140,13 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   close(jit_fd); continue;
   }
   uint32_t pkt_seq; memcpy(&pkt_seq, pkt + 6, 4); pkt_seq = ntohl(pkt_seq);
+  int64_t err_ns = (int64_t)mpcp_now_raw_ns() - (int64_t)expected;
+  pid_integral_ns += (double)err_ns;
+  if (pid_integral_ns > 5000000.0) pid_integral_ns = 5000000.0;
+  if (pid_integral_ns < -5000000.0) pid_integral_ns = -5000000.0;
+  pid_correction_ns += Kp * (double)err_ns + Ki * pid_integral_ns;
+  if (pid_correction_ns > 5000000.0) pid_correction_ns = 5000000.0;
+  if (pid_correction_ns < -5000000.0) pid_correction_ns = -5000000.0;
   bool pkt_is_ghost = false;
   for (uint32_t g = 0; g < ctx->ghost_count; g++)
   if (ctx->ghost_seqs[g] == pkt_seq) { pkt_is_ghost = true; break; }
@@ -6886,6 +6977,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   {
   mpcp_session_t sess;
   memset(&sess, 0, sizeof(sess));
+  sess.drift_coefficient = 1.0;
   randombytes_buf(sess.session_nonce, MPCP_SESSION_NONCE_LEN);
   randombytes_buf(sess.session_key,   MPCP_SESSION_KEY_LEN);
   /* keystream is O(1) on-the-fly — no allocation needed */
@@ -7596,6 +7688,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (sess->blink_interval_ns > 0)
   sess->blink_origin_ns = now_ns + lead_ns;
   sess->t_zero_ns      = sess->blink_origin_ns;
+  sess->drift_coefficient = (sess->drift_coefficient == 0.0) ? 1.0 : sess->drift_coefficient;
   uint64_t delay_be = __builtin_bswap64(delay_ns);
   memcpy(plain + 5, &delay_be, 8);
   uint64_t bi_be = __builtin_bswap64(sess->blink_interval_ns);
@@ -7679,6 +7772,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   sess->clock_offset_ns   = 0;
   sess->blink_origin_ns   = mpcp_now_ns() + delay_ns;
   sess->t_zero_ns        = sess->blink_origin_ns;
+  sess->drift_coefficient = 1.0;
   sess->blink_interval_ns = __builtin_bswap64(bi_be);
   fprintf(stderr, "[blink] receiver: interval=%.1fms  origin_in=%.0fms\n",
   (double)sess->blink_interval_ns / 1e6,
@@ -7699,6 +7793,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   sess->blink_interval_ns = 0;
   sess->blink_origin_ns   = 0;
   sess->t_zero_ns        = 0;
+  sess->drift_coefficient = 1.0;
   } else {
   return MPCP_ERR_PROTO;
   }
@@ -8390,6 +8485,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (!ask_yn("Proceed?", true)) { printf("Aborted.\n"); return 0; }
   mpcp_session_t    sess;
   memset(&sess, 0, sizeof(sess));
+  sess.drift_coefficient = 1.0;
   randombytes_buf(sess.session_nonce, MPCP_SESSION_NONCE_LEN);
   mpcp_candidates_t cands;
   memset(&cands, 0, sizeof(cands));
@@ -8411,6 +8507,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   sess.blink_interval_ns = preflight.blink_interval_ns;
   sess.blink_origin_ns   = preflight.tzero_ns;
   sess.t_zero_ns         = preflight.tzero_ns;
+  sess.drift_coefficient = preflight.drift_coefficient;
   printf("  Pre-flight lock : %s\n", preflight.handshake_locked ? "LOCKED" : "FAILED");
   printf("  Stable RTT      : %.3f ms\n", preflight.stable_mean_rtt_ms);
   printf("  Jitter variance : %.6f ms^2\n", preflight.jitter_variance_ms2);
