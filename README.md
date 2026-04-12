@@ -1,109 +1,255 @@
-# ☾ ClockWork ☽
+# ClockWork
 
-### 🌌 Nightbound synchronization for ClockWork 🌌
+```text
+        .-===========-.
+        |  CLOCKWORK  |
+        |   00:00:00  |
+        '-===========-'
 
-...
+        ⚙      ⚙      ⚙
+     ⚙     ⚙      ⚙     ⚙
+        ⚙      ⚙      ⚙
+```
 
-**Protocol** · ClockWork v0.5
+A file transfer system that does not rely on connection — only agreement.
 
-**Project** · ClockWork
+---
 
-...
+## What it is
 
-ClockWork is the tooling and reference implementation built around **ClockWork** — the **Multi-Port Catch Protocol**.
+ClockWork is a file transfer application built on top of the **MPCP (Multi-Port Catch Protocol)**.
 
-...
+It does not stream data over a stable connection.
+It schedules it.
 
-**ClockWork** is the protocol.
+Both sides independently follow the same:
 
-**ClockWork** is the implementation and tooling built around it.
+* timing windows
+* port sequence
+* cryptographic schedule
 
-...
+The file emerges from alignment, not continuity.
 
-- ClockWork defines behavior, timing, and cryptographic structure
-- ClockWork executes and exposes that system
+---
 
-...
+## Mechanical Model
 
+```text
+        [ SENDER ]
+             ⚙
+      (chunk → encrypt)
+             ⚙
+      (time-slot emit)
+             ⚙
+        ports rotate
+   4102 → 5931 → 7773 → ...
+             ⚙
+             ▼
+
+        [ RECEIVER ]
+             ⚙
+      (multi-port intake)
+             ⚙
+      (time alignment)
+             ⚙
+      (reassembly engine)
+             ⚙
+           FILE
+```
+
+Each gear is independent.
+Nothing “holds” the connection together.
+
+---
+
+## Core Behaviors (from code)
+
+### Time is the transport
+
+```text
+send(packet, t = exact)
+receive(window = computed)
+```
+
+* nanosecond clocks (`clock_gettime`)
+* calibrated RTT using trimmed mean + MAD + EWMA
+* adaptive catch window per session
+
+The network is noisy.
+ClockWork models the noise, then moves through it.
+
+---
+
+### Multi-port sequencing
+
+```text
+chunk[i] → port = f(session_key, i)
+```
+
+* ports derived from HKDF keystream
+* wide port range (default ~55k span)
+* no fixed channel
+
+Packets do not form a stream.
+They scatter and are re-collected.
+
+---
+
+### Encrypted chunk engine
+
+```text
+plaintext → pad → encrypt → emit
+```
+
+* XChaCha20-Poly1305 per chunk
+* unique nonce per emission
+* fixed-size padded chunks (traffic shaping)
+
+All chunks look the same.
+Real and fake are indistinguishable.
+
+---
+
+### Ghost traffic
+
+```text
+real:   [data]
+ghost:  [indistinguishable noise]
+```
+
+* deterministic ghost map from session key
+* injected into stream as valid ciphertext
+* receiver discards via schedule knowledge
+
+Noise is not decoration.
+It is structural.
+
+---
+
+### No connection state
+
+```text
+(no TCP)
+(no stream)
+(no session socket)
+```
+
+* UDP / raw send
+* no handshake persistence
+* no teardown signal
+
+Start → operate → disappear
+
+---
+
+### Tripwire system
+
+```text
+anomaly → zero keys → exit(0)
+```
+
+* z-score RTT anomaly detection
+* loss-pattern analysis (chi-squared)
+* silent abort + canary log
+
+Failure is not reported.
+It is erased.
+
+---
+
+### Pipeline architecture
+
+```text
+[read] → [compress] → [encrypt] → [send]
+```
+
+* lock-free ring buffers
+* multi-threaded stages
+* optional zero-copy + batched syscalls
+
+Work flows forward continuously.
+No stage waits longer than needed.
+
+---
+
+### Key system
+
+```text
+N candidate keys → blind selection → 1 survives
+```
+
+* parallel key candidates
+* constant-time selection (receiver side)
+* all unused keys wiped immediately
+
+Only one path becomes real.
+
+---
+
+## Visualization: timing-driven transfer
+
+```text
+Time ─────────────────────────────────▶
+
+Sender:    [pkt]     [pkt]      [pkt]
+              │         │          │
+              ▼         ▼          ▼
+Ports:     4102      5931       7773
+              │         │          │
+              ▼         ▼          ▼
+Receiver:  [buf]     [buf]      [buf]
+
+Reconstruction:
+   t0 → t1 → t2 → reorder → file
+```
+
+No continuous stream.
+Only correct arrival within time windows.
+
+---
+
+## Build
+
+```bash
 gcc -std=c11 -D_GNU_SOURCE -O2 ClockWork.c -o clockwork -lsodium -lzstd -lm -lpthread
+```
 
-gcc -std=c11 -D_GNU_SOURCE -O2 ClockWork_plain.c -o clockwork -lsodium -lzstd -lm -lpthread
+---
 
-...
+## Run
 
-make clockwork-plain
-
-...
-
+```bash
+./clockwork
 ./clockwork --test
-
 ./clockwork --selftest
-
 ./clockwork --bench
+./clockwork -v
+```
 
-...
+---
 
-ClockWork is asymmetric — **the receiver starts first.**
+## Design Summary
 
-...
+ClockWork behaves like a machine:
 
-./clockwork  →  1) Send / Receive  →  2) Receive a file
+* timing is the drive shaft
+* ports are rotating gears
+* chunks are teeth
+* the receiver is the assembly stage
 
-./clockwork  →  1) Send / Receive  →  1) Send a file
+Nothing is continuous.
+Everything is coordinated.
 
-...
+---
 
-./clockwork                # interactive menu
+## Spec
 
-./clockwork --test         # unit tests only (no network)
+```text
+ClockWork_v0.5_FINAL_PowerTea-2.pdf
+```
 
-./clockwork --selftest     # unit tests + loopback integration
+---
 
-./clockwork --bench        # loopback throughput benchmark
+## License
 
-./clockwork -v             # verbose — writes session log to ~/.config/clockwork/
-
-...
-
-./clockwork  →  profile 4 (stealth)  →  Generate new keypair: Y
-
-Writes to `~/.config/clockwork/keys/`:
-
-- `clockwork_ed25519.sk` — your secret key (mode 0600, never share)
-- `clockwork_ed25519.pk` — your public key (share with peer)
-
-...
-
-~/.config/clockwork/keys/clockwork_ed25519_peer.pk
-
-If no peer key is found, ClockWork falls back to PSK-only and tells you exactly what to copy where.
-
-...
-
-ClockWork detects `firewalld`, `ufw`, or `iptables` and offers to open ports automatically (one `sudo` prompt). Ports are closed when the session ends.
-
-...
-
-| `~/.config/clockwork/contacts` | Saved peer aliases |
-| `~/.config/clockwork/keys/` | Ed25519 keypair (stealth only) |
-| `~/.config/clockwork/canary.log` | Tripwire abort events |
-| `~/.config/clockwork/clockwork-log-*.txt` | Verbose session logs (`-v`) |
-| `<output>.clockwork_resume` | Partial transfer state — deleted on success |
-
-...
-
-ClockWork.c          ← single-file colour build (amalgam)
-
-ClockWork_plain.c    ← single-file headless build (amalgam)
-
-...
-
-│   ├── clockwork.h          all types, constants, prototypes, colour macros
-
-...
-
-- label deviations from the ClockWork spec as **Unverified Implementation**
-
-...
-
-Full protocol specification: `ClockWork_v0.5_FINAL_PowerTea-2.pdf`
+<define here>
