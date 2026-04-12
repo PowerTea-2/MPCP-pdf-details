@@ -2903,7 +2903,7 @@ uint16_t p = kex_port(master_secret, session_nonce, i,
 port_base, port_range);
 socks[i].fd   = open_udp_port(p);
 socks[i].port = p;
-if (socks[i].fd >= 0) opened++;
+if (socks[i].fd >= 0) { opened++; fprintf(stderr, "[Handshake] Successfully bound KEX port %u\n", p); }
 else fprintf(stderr, "[exchange] open port %u: %s\n", p, strerror(errno));
 }
 return opened;
@@ -2992,6 +2992,61 @@ if (rc != MPCP_OK) fprintf(stderr, "[exchange] Ed25519 auth FAILED\n");
 else               fprintf(stderr, "[exchange] Ed25519 auth OK\n");
 return rc;
 }
+typedef struct __attribute__((packed)) {
+mpcp_hdr_t hdr;
+uint64_t   tzero_ns_be;
+} mpcp_kex_sync_pkt_t;
+
+static int kex_send_tzero_sync(const mpcp_config_t *cfg,
+const mpcp_session_t *sess,
+const struct sockaddr_in *pc1_addr,
+uint64_t tzero_ns)
+{
+uint16_t auth_port = kex_port(sess->master_secret, sess->session_nonce,
+0xFFFFFFFFu, cfg->port_base, cfg->port_range);
+int fd = socket(AF_INET, SOCK_DGRAM, 0);
+if (fd < 0) return MPCP_ERR_IO;
+mpcp_kex_sync_pkt_t pkt;
+memset(&pkt, 0, sizeof(pkt));
+uint32_t magic_be = htonl(MPCP_MAGIC);
+memcpy(&pkt.hdr.magic, &magic_be, 4);
+pkt.hdr.version = MPCP_VERSION;
+pkt.hdr.type    = MPCP_TYPE_ACK;
+pkt.tzero_ns_be = __builtin_bswap64(tzero_ns);
+struct sockaddr_in dst = *pc1_addr;
+dst.sin_port = htons(auth_port);
+for (int i = 0; i < 5; i++) {
+sendto(fd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(dst));
+struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000L };
+nanosleep(&ts, NULL);
+}
+close(fd);
+return MPCP_OK;
+}
+
+static int kex_recv_tzero_sync(const mpcp_config_t *cfg,
+mpcp_session_t *sess,
+uint64_t *tzero_out)
+{
+uint16_t auth_port = kex_port(sess->master_secret, sess->session_nonce,
+0xFFFFFFFFu, cfg->port_base, cfg->port_range);
+int fd = open_udp_port(auth_port);
+if (fd < 0) return MPCP_ERR_IO;
+struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+int pr = poll(&pfd, 1, 3000);
+if (pr <= 0) { close(fd); return MPCP_ERR_TIMEOUT; }
+mpcp_kex_sync_pkt_t pkt;
+ssize_t n = recvfrom(fd, &pkt, sizeof(pkt), 0, NULL, NULL);
+close(fd);
+if (n != (ssize_t)sizeof(pkt)) return MPCP_ERR_PROTO;
+uint32_t magic;
+memcpy(&magic, &pkt.hdr.magic, 4);
+if (ntohl(magic) != MPCP_MAGIC || pkt.hdr.version != MPCP_VERSION || pkt.hdr.type != MPCP_TYPE_ACK)
+return MPCP_ERR_PROTO;
+*tzero_out = __builtin_bswap64(pkt.tzero_ns_be);
+return MPCP_OK;
+}
+
 int mpcp_exchange_pc1(const mpcp_config_t     *cfg,
 mpcp_session_t          *sess,
 const struct sockaddr_in *pc2_addr,
@@ -3047,15 +3102,17 @@ sendto(socks[i].fd, &pc1_pkts[i], sizeof(pc1_pkts[i]), 0,
 (struct sockaddr *)&dst, sizeof(dst));
 }
 fprintf(stderr, "[exchange] PC1: sent %u candidates (retransmit)\n", N);
-next_send = mpcp_now_ns() + 500000000ULL;
+next_send = mpcp_now_ns() + 100000000ULL;
 }
 bool any_new = false;
 for (uint32_t i = 0; i < N; i++) {
 if (socks[i].fd < 0 || received[i]) continue;
 uint8_t buf[sizeof(mpcp_key_pkt_t)];
 struct sockaddr_in from_pc2; socklen_t flen = sizeof(from_pc2);
+struct pollfd pfd = { .fd = socks[i].fd, .events = POLLIN, .revents = 0 };
+if (poll(&pfd, 1, 3000) <= 0) continue;
 ssize_t n = recvfrom(socks[i].fd, buf, sizeof(buf),
-MSG_DONTWAIT, (struct sockaddr *)&from_pc2, &flen);
+0, (struct sockaddr *)&from_pc2, &flen);
 if (n != (ssize_t)sizeof(mpcp_key_pkt_t)) continue;
 if (from_pc2.sin_addr.s_addr != pc2_addr->sin_addr.s_addr) continue;
 const mpcp_key_pkt_t *pkt = (const mpcp_key_pkt_t *)buf;
@@ -3068,6 +3125,7 @@ if (idx < N && !received[idx]) {
 memcpy(recv_keys[idx], tmp, 32);
 received[idx] = true;
 any_new = true;
+fprintf(stderr, "[Handshake] Received peer candidate idx=%u on port %u\n", idx, socks[i].port);
 }
 sodium_memzero(tmp, 32);
 }
@@ -3100,6 +3158,15 @@ if (rc != MPCP_OK) goto done_pc1;
 mpcp_keygen_candidates_wipe_losers(cands_out, selected_idx);
 rc = auth_send_sig(cfg, sess, pc2_addr);
 if (rc != MPCP_OK) goto done_pc1;
+{
+uint64_t synced_tzero = 0;
+int src = kex_recv_tzero_sync(cfg, sess, &synced_tzero);
+if (src == MPCP_OK) {
+sess->t_zero_ns = synced_tzero;
+sess->blink_origin_ns = synced_tzero;
+fprintf(stderr, "[Handshake] Synchronized T-Zero to %llu\n", (unsigned long long)synced_tzero);
+}
+}
 fprintf(stderr, "[exchange] PC1: session key ready\n");
 rc = MPCP_OK;
 done_pc1:
@@ -3146,8 +3213,10 @@ for (uint32_t i = 0; i < N; i++) {
 if (got_key[i] || recv_socks[i].fd < 0) continue;
 uint8_t buf[sizeof(mpcp_key_pkt_t)];
 struct sockaddr_in from_pc1; socklen_t flen2 = sizeof(from_pc1);
+struct pollfd pfd = { .fd = recv_socks[i].fd, .events = POLLIN, .revents = 0 };
+if (poll(&pfd, 1, 3000) <= 0) continue;
 ssize_t n = recvfrom(recv_socks[i].fd, buf, sizeof(buf),
-MSG_DONTWAIT, (struct sockaddr *)&from_pc1, &flen2);
+0, (struct sockaddr *)&from_pc1, &flen2);
 if (n != (ssize_t)sizeof(mpcp_key_pkt_t)) continue;
 if (from_pc1.sin_addr.s_addr != pc1_addr->sin_addr.s_addr) continue;
 const mpcp_key_pkt_t *pkt = (const mpcp_key_pkt_t *)buf;
@@ -3156,6 +3225,7 @@ if (mpcp_kex_unpack(sess->master_secret, pkt, all_keys[i]) != MPCP_OK)
 continue;
 got_key[i] = true;
 any_new = true;
+fprintf(stderr, "[Handshake] Received peer candidate idx=%u on port %u\n", i, recv_socks[i].port);
 }
 if (!any_new) {
 struct timespec ts = {0, 1000000L};
@@ -3254,6 +3324,11 @@ free(send_socks);
 free_key_bufs(return_buf, N);
 rc = auth_recv_verify(cfg, sess);
 if (rc != MPCP_OK) goto done_pc2;
+uint64_t final_tzero = mpcp_now_ns() + 2000000000ULL;
+sess->t_zero_ns = final_tzero;
+sess->blink_origin_ns = final_tzero;
+(void)kex_send_tzero_sync(cfg, sess, pc1_addr, final_tzero);
+fprintf(stderr, "[Handshake] Synchronized T-Zero to %llu\n", (unsigned long long)final_tzero);
 fprintf(stderr, "[exchange] PC2: exchange complete, session key ready\n");
 rc = MPCP_OK;
 done_pc2:
@@ -8522,7 +8597,6 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   int rc = MPCP_OK;
   spinner_t sp;
   if (is_sender) {
-  fw_maybe_open(cfg.port_base, cfg.port_range);
   banner("Calibrating link");
   printf("  Sending pings to receiver at %s:%u …\n",
   inet_ntoa(peer_addr.sin_addr), cfg.port_base);
@@ -8620,7 +8694,6 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   mpcp_perror("send", rc);
   }
   } else {
-  fw_maybe_open(cfg.port_base, cfg.port_range);
   banner("Waiting for sender");
   {
   struct ifaddrs *ifap, *ifa;
@@ -8896,6 +8969,12 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   return 1;
   }
   contacts_load();
+  {
+  mpcp_config_t _fw_cfg;
+  mpcp_config_defaults(&_fw_cfg);
+  mpcp_config_load_default(&_fw_cfg);
+  fw_maybe_open(_fw_cfg.port_base, _fw_cfg.port_range);
+  }
   ui_colour_init();
   ui_print_logo();
   for (;;) {
