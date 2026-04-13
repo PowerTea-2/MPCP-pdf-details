@@ -1,9 +1,14 @@
-// Version: AethroSync v0.8-PROD
+// Version: AethroSync v0.9-PROD
 // Author: PowerTea-2 
 // Build:  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O3 clockwork.c -o mpcp -lsodium -lzstd -lm -lpthread
 // Logic:  BLOCK-SYNC (256) | O(1)-KEYSTREAM | HW-TIMESTAMP | CONDVAR-RING | GHOST-STEALTH
 // Arch:   On-the-fly ChaCha20 keystream (no malloc) | condvar ring | hw-level RTT | Ed25519 UX
-// NOTE: IF EDITING THIS FILE, MAKE SURE TO ALWAYS CHANGE THIS NUMBER TO ONE DECIMAL HIGHER TO TRACK VERSION: 0.8-test
+// NOTE: IF EDITING THIS FILE, MAKE SURE TO ALWAYS CHANGE THIS NUMBER TO ONE DECIMAL HIGHER TO TRACK VERSION: 0.9-test
+// FIXES v0.9: (1) Ghost ping sent to port_base not ghost_port [calibration MPCP_ERR_TIMEOUT]
+//             (2) pong_server max_pings budget 170->1800 + reflect PINGs in SIG_READY phase
+//             (3) tzero_ns clock domain: CLOCK_MONOTONIC_RAW -> CLOCK_MONOTONIC throughout Phase 4
+//             (4) blink_hop_port / blink_hop_port_subidx / mpcp_get_chunk_params / xfer_info_port: guard port_range==0
+//             (5) MPCP_FLAG_LAST_CHUNK 0x02->0x80 to eliminate collision with MPCP_FLAG_DECOY_ENCODING
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -587,7 +592,7 @@ uint64_t   scheduled_time_ns;
 } mpcp_chunk_hdr_t;
 #define MPCP_FLAG_SKIP_COMPRESSION  0x01
 #define MPCP_FLAG_DECOY_ENCODING    0x02  
-#define MPCP_FLAG_LAST_CHUNK        0x02
+#define MPCP_FLAG_LAST_CHUNK        0x80  /* chunk-slot flag; deliberately separated from xfer_flags space */
 #define MPCP_STATIC_ASSERT(cond, msg) typedef char static_assert_##msg[(cond) ? 1 : -1]
 MPCP_STATIC_ASSERT(sizeof(mpcp_hdr_t)        ==  6, hdr_must_be_6);
 MPCP_STATIC_ASSERT(sizeof(mpcp_cal_pkt_t)    == 64, cal_pkt_must_be_64);
@@ -1098,7 +1103,9 @@ return rc;
   ((uint32_t)stream[33] << 16) |
   ((uint32_t)stream[34] <<  8) |
   ((uint32_t)stream[35]);
-  *port_out = (uint16_t)(seed % cfg->port_range + cfg->port_base);
+  *port_out = (cfg->port_range > 0)
+      ? (uint16_t)(seed % cfg->port_range + cfg->port_base)
+      : cfg->port_base;
   sodium_memzero(stream, sizeof(stream));
   }
   int mpcp_derive_session_key(const uint8_t *master_secret,  
@@ -2323,14 +2330,17 @@ else if (jitter_us > 1000.0) calib_out->blink_interval_ns = 100000000ULL;
 else calib_out->blink_interval_ns = 25000000ULL;
 }
 
-/* Phase 4: epoch handshake + bounded ghost verification */
+/* Phase 4: epoch handshake + bounded ghost verification
+ * Ghost ping is sent to port_base (where pong_server listens).
+ * calib_out->ghost_port is the HKDF seed for transfer-phase port hopping,
+ * not the probe target — sending to it would hit a dead socket. */
 calib_out->ghost_port = calib_ghost_port(cfg, sess);
 struct sockaddr_in ghost_peer = *peer_addr;
-ghost_peer.sin_port = htons(calib_out->ghost_port);
-calib_out->tzero_ns = mpcp_now_raw_ns() + 2000000000ULL;
+/* Use CLOCK_MONOTONIC here (same domain as all blink/transfer timing) */
+calib_out->tzero_ns = mpcp_now_ns() + 2000000000ULL;
 uint64_t fire_ns = calib_out->tzero_ns + calib_out->blink_interval_ns;
-while (mpcp_now_raw_ns() < fire_ns) {
-uint64_t rem = fire_ns - mpcp_now_raw_ns();
+while (mpcp_now_ns() < fire_ns) {
+uint64_t rem = fire_ns - mpcp_now_ns();
 struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)((rem > 1000000ULL) ? 1000000ULL : rem) };
 nanosleep(&ts, NULL);
 }
@@ -3780,6 +3790,7 @@ static uint16_t blink_hop_port(const mpcp_session_t *sess,
 const mpcp_config_t  *cfg,
 uint32_t              chunk_idx)
 {
+if (cfg->port_range == 0) return cfg->port_base;
 uint32_t hop_interval = (cfg->port_hop_interval > 0) ? cfg->port_hop_interval : 1u;
 uint32_t hop_base     = (chunk_idx / hop_interval) * hop_interval;
 uint8_t ikm[9 + 4 + 32];
@@ -5113,6 +5124,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   uint32_t chunk_idx,
   uint8_t sub_index)
   {
+  if (cfg->port_range == 0) return cfg->port_base;
   uint32_t hop_interval = (cfg->port_hop_interval > 0) ? cfg->port_hop_interval : 1u;
   uint32_t hop_base     = (chunk_idx / hop_interval) * hop_interval;
   uint8_t nonce_x[MPCP_SESSION_NONCE_LEN];
@@ -7813,7 +7825,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   uint32_t seed = ((uint32_t)out[0] << 24) | ((uint32_t)out[1] << 16) |
   ((uint32_t)out[2] <<  8) |  (uint32_t)out[3];
-  return (uint16_t)(seed % cfg->port_range + cfg->port_base);
+  return (cfg->port_range > 0)
+      ? (uint16_t)(seed % cfg->port_range + cfg->port_base)
+      : cfg->port_base;
   }
   static int transfer_info_send(mpcp_session_t       *sess,
   const mpcp_config_t  *cfg,
@@ -8045,7 +8059,12 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   tv2.tv_usec = (suseconds_t)((idle_ms % 1000u) * 1000u);
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
   }
-  uint32_t max_pings = cfg->ping_count_max + 30;
+  /* Budget must cover Phase-1 (150 pings) + Phase-2 (up to ~1000 pings at 2ms
+   * intervals over 2 seconds).  The old cfg->ping_count_max+30 only covered
+   * the legacy calibrate_collect_samples path and was far too small. */
+  uint32_t max_pings = cfg->slow_mode
+      ? (cfg->ping_count_max + 30u)   /* slow-mode: few pings, long gaps */
+      : 1800u;                         /* fast-mode: Phase1(150)+Phase2(~1000)+margin */
   uint32_t reflected = 1;
   while (reflected < max_pings) {
   ssize_t n = recvfrom(fd, buf, sizeof(buf), 0,
@@ -8098,7 +8117,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   fprintf(stderr, "\r  %u pings reflected -- awaiting sender ready signal...        \n", reflected);
   {
-  struct timeval tv_ready = { .tv_sec = 12, .tv_usec = 0 };
+  /* Lead time is 2s (tzero_ns = now+2s in calibrate Phase 4) plus blink_interval.
+   * Allow 20 seconds total: covers any Phase-2 overshoot and network variance. */
+  struct timeval tv_ready = { .tv_sec = 20, .tv_usec = 0 };
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_ready, sizeof(tv_ready));
   bool got_ready = false;
   while (!got_ready) {
@@ -8122,6 +8143,29 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   memcpy(&magic, &ready->hdr.magic, 4);
   if (ntohl(magic) != MPCP_MAGIC) continue;
   if (ready->hdr.version != MPCP_VERSION) continue;
+  /* Reflect any stray PING packets that arrive during this window.
+   * This includes the Phase-4 ghost probe from mpcp_calibrate, which
+   * fires after ~2s lead time.  Without this the ghost pong never
+   * returns and calib->handshake_locked stays false. */
+  if (ready->hdr.type == MPCP_TYPE_PING) {
+  if (nonce_hint_out &&
+  memcmp(ready->nonce_hint, nonce_hint_out, MPCP_NONCE_HINT_LEN) != 0)
+  continue;
+  mpcp_cal_pkt_t pong;
+  memcpy(&pong, ready, sizeof(pong));
+  pong.hdr.type = MPCP_TYPE_PONG;
+  uint8_t wire_buf_r[512];
+  size_t  wire_len_r = sizeof(pong);
+  if (cfg->disguise_calibration) {
+  wire_len_r = mpcp_disguise_wrap((const uint8_t *)&pong, sizeof(pong),
+  wire_buf_r, sizeof(wire_buf_r), cfg->disguise_protocol);
+  if (wire_len_r == 0) continue;
+  } else {
+  memcpy(wire_buf_r, &pong, sizeof(pong));
+  }
+  sendto(fd, wire_buf_r, wire_len_r, 0, (struct sockaddr *)&sender, slen);
+  continue;
+  }
   if (ready->hdr.type != MPCP_SIG_READY) continue;
   if (sender_addr_out && sender.sin_addr.s_addr != sender_addr_out->sin_addr.s_addr) continue;
   if (nonce_hint_out && sodium_memcmp(ready->nonce_hint, nonce_hint_out, MPCP_NONCE_HINT_LEN) != 0) continue;
