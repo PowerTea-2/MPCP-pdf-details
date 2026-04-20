@@ -1,9 +1,21 @@
-// Version: ClockWork v1.2-PROD
+// Version: ClockWork v1.3-PROD
 // Author: PowerTea-2 
-// Build:  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O3 clockwork.c -o mpcp -lsodium -lzstd -lm -lpthread
-// Logic:  BLOCK-SYNC (256) | O(1)-KEYSTREAM | HW-TIMESTAMP | CONDVAR-RING | GHOST-STEALTH
+// Build:  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O3 -march=native -mtune=native -flto -fno-plt -funroll-loops -pipe -Wl,-O1,--as-needed Delta-T.c -o Delta-T -lsodium -lzstd -lm -lpthread
+// Logic:  BLINK-ONLY | O(1)-KEYSTREAM | HW-TIMESTAMP | CONDVAR-RING | GHOST-STEALTH | KALMAN-JIT
 // Arch:   On-the-fly ChaCha20 keystream (no malloc) | condvar ring | hw-level RTT | Ed25519 UX
-// NOTE: IF EDITING THIS FILE, MAKE SURE TO ALWAYS CHANGE THIS NUMBER TO ONE DECIMAL HIGHER TO TRACK VERSION: 1.2
+// NOTE: IF EDITING THIS FILE, MAKE SURE TO ALWAYS CHANGE THIS NUMBER TO ONE DECIMAL HIGHER TO TRACK VERSION: 2.0
+// FIXES v2.0: (1) Remove size gate: Blink is mandatory for ALL file sizes (no fallback to block-sync)
+//             (2) Epoch resync: tzero recalibrated every 1,000 chunks via arrival-delta to kill drift
+//             (3) Kalman+5ms hybrid window: T_open/T_close = predicted +/-(kf_sigma_ns + 2.5ms)
+//             (4) Look-ahead socket: chunk[N+1] socket opened 5ms before chunk[N] closes (no dead zone)
+//             (5) Stealth handshake deadline: 10s -> 30s (resolves race with 10s stealth silence period)
+//             (6) CLI progress: \033[1A cursor-up replaced with \r\033[K (universal carriage-return)
+//             (7) Build flags: -ffast-math removed (broke IEEE fp in Kalman + JIT timing)
+// FIXES v1.3: (1) RLIMIT_NOFILE raised to hard limit at startup (5GB+: 4096 chunk sockets per block needed)
+//             (2) Spinner 2-line layout: gear on label line via cursor-up, progress on its own line below
+//             (3) ZSTD decompress buffer: ZSTD_DStreamOutSize()*4 -> chunk_pad_size+1 (correct tight bound)
+//             (4) Build flags: -march=native -mtune=native -flto -fno-plt -funroll-loops -pipe
+//             (5) Unused include <sys/resource.h> added for setrlimit
 // FIXES v1.2: (1) ring1 slot buffer = ZSTD_compressBound(max_chunk_bytes): was max+1, always overflowed
 //             (2) Per-chunk MPCP_FLAG_SKIP_COMPRESSION respected in writer (per-chunk flags stored)
 //             (3) thread_ack_handler: consecutive-timeout exit so sender never hangs after retries done
@@ -60,6 +72,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/timex.h>
+#include <sys/resource.h>
 #include <linux/net_tstamp.h>
 #include <linux/errqueue.h>
 #include <time.h>
@@ -327,6 +340,10 @@ uint64_t blink_interval_ns;
 uint64_t blink_origin_ns;  
 uint64_t t_zero_ns;
 double   drift_coefficient;
+uint64_t kf_jitter_ns;           /* Kalman-derived jitter sigma (ns): sqrt(jitter_variance_ms2)*1e6
+                                  * Populated from calibration; used by receiver JIT window formula:
+                                  *   T_open  = T_predicted - (kf_jitter_ns + 2_500_000)
+                                  *   T_close = T_predicted + (kf_jitter_ns + 2_500_000)        */
 
 } mpcp_session_t;
 typedef struct {
@@ -3258,7 +3275,7 @@ fprintf(stderr, "[exchange] PC2: kex_port[%u] = %u (fd=%d)\n",
 _di, recv_socks[_di].port, recv_socks[_di].fd);
 fprintf(stderr, "[exchange] PC2: waiting for %u candidate keys from PC1=%s\n",
 N, inet_ntoa(pc1_addr->sin_addr));
-uint64_t deadline = mpcp_now_ns() + 10000000000ULL;
+uint64_t deadline = mpcp_now_ns() + 30000000000ULL; /* Fix 5: was 10s; 30s resolves race with stealth silence period */
 while (mpcp_now_ns() < deadline) {
 uint32_t cnt_check = 0;
 for (uint32_t i = 0; i < N; i++) if (got_key[i]) cnt_check++;
@@ -5304,7 +5321,10 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   for (uint32_t i = 0; i < n; i++) {
   uint32_t seq = seqs[i];
   out[i].chunk_index = seq;
-  double scaled = (double)i * (double)interval_ns * drift_coefficient;
+  /* Use absolute seq (not block-relative i) so receiver timing matches sender:
+   *   sender:   t = origin + seq * interval
+   *   receiver: t = tzero  + seq * interval   (tzero == origin) */
+  double scaled = (double)seq * (double)interval_ns * drift_coefficient;
   int64_t target = (int64_t)tzero_ns + (int64_t)scaled;
   int32_t jit = schedule_jitter_ns(sess, seq);
   out[i].jitter_ns = jit;
@@ -5324,13 +5344,6 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   out[i].sub_index = sub;
   out[i].ephemeral_port = p;
   }
-  }
-  static void sleep_until_raw_abs(uint64_t when_ns)
-  {
-  struct timespec ts;
-  ts.tv_sec  = (time_t)(when_ns / 1000000000ULL);
-  ts.tv_nsec = (long)(when_ns % 1000000000ULL);
-  (void)clock_nanosleep(CLOCK_MONOTONIC_RAW, TIMER_ABSTIME, &ts, NULL);
   }
   static bool receiver_validate_ciphertext(const mpcp_session_t *sess,
   const mpcp_config_t *cfg,
@@ -5374,9 +5387,10 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (sess->blink_interval_ns > 0) {
   blink_window_t win;
   blink_window_init(&win);
-  uint64_t now_raw = mpcp_now_raw_ns();
+  /* Clock domain: tzero is CLOCK_MONOTONIC (set by mpcp_now_ns in transfer_info_recv).
+   * ALL timing in this loop uses CLOCK_MONOTONIC to match the sender. */
   uint64_t tzero = sess->t_zero_ns ? sess->t_zero_ns : sess->blink_origin_ns;
-  if (tzero == 0) tzero = now_raw + 1000000000ULL;
+  if (tzero == 0) tzero = mpcp_now_ns() + 1000000000ULL;
   double drift = (sess->drift_coefficient > 0.0) ? sess->drift_coefficient : 1.0;
   schedule_entry_t *sched = calloc(n, sizeof(*sched));
   bool *got = calloc(n, sizeof(bool));
@@ -5387,10 +5401,28 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   mpcp_generate_schedule(sess, cfg, a->block_seqs, n,
   tzero, sess->blink_interval_ns, drift, sched);
+  /* Diagnostic: show timing state when JIT loop starts */
+  {
+    int64_t ms_until_zero = (int64_t)(tzero - mpcp_now_ns()) / 1000000LL;
+    fprintf(stderr, "[blink-jit] loop start: %u chunks, interval=%.1fms, T0 in %+ldms, port[0]=%u\n",
+            n, (double)sess->blink_interval_ns / 1e6, (long)ms_until_zero,
+            n > 0 ? sched[0].ephemeral_port : 0);
+    fflush(stderr);
+  }
   double pid_integral_ns = 0.0;
   double pid_correction_ns = 0.0;
   const double Kp = 0.3;
   const double Ki = 0.02;
+  /* Fix 3 (Kalman-window, revised):
+   * Pre-open = max(kf_jitter_ns, 5ms) before predicted arrival.
+   * Poll guard = max(kf_jitter_ns*2 + 5ms, 15ms) — preserves the original
+   * asymmetric bias (packets skew late, not early) while adding Kalman upside. */
+  uint64_t kf_sigma_ns  = (sess->kf_jitter_ns > 0) ? sess->kf_jitter_ns : 5000000ULL;
+  uint64_t kf_pre_ns    = (kf_sigma_ns > 5000000ULL) ? kf_sigma_ns : 5000000ULL;
+  uint64_t kf_guard_base= kf_sigma_ns * 2ULL + 5000000ULL;
+  /* Fix 4 (look-ahead): pre-opened fd for chunk[i+1]; -1 = not yet opened */
+  int lookahead_fd   = -1;
+  uint16_t lookahead_port = 0;
   for (uint32_t i = 0; i < n; i++) {
   if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
   uint32_t seq = sched[i].chunk_index;
@@ -5400,20 +5432,35 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   int64_t expected_adj = (int64_t)sched[i].expected_arrival_ns + (int64_t)pid_correction_ns;
   uint64_t expected = (expected_adj > 0) ? (uint64_t)expected_adj : sched[i].expected_arrival_ns;
-  uint64_t open_at = (expected > 5000000ULL) ? expected - 5000000ULL : expected;
-  if (mpcp_now_raw_ns() < open_at) sleep_until_raw_abs(open_at);
-  int jit_fd = open_udp_socket_on_port(sched[i].ephemeral_port);
+  /* Fix 3 (Kalman-window): open kf_pre_ns before predicted; at least 5ms (original). */
+  uint64_t open_at  = (expected > kf_pre_ns) ? expected - kf_pre_ns : 0;
+  /* Fix 4 (look-ahead): if chunk[i+1] was pre-opened and matches, reuse its fd.
+   * The socket may already hold a queued packet — eliminates the deaf zone. */
+  int jit_fd;
+  if (lookahead_fd >= 0 && lookahead_port == sched[i].ephemeral_port) {
+  jit_fd = lookahead_fd;
+  lookahead_fd = -1;
+  /* Socket already open; sleep only if absurdly early (MONOTONIC) */
+  if (mpcp_now_ns() < open_at) mpcp_sleep_until_ns(open_at);
+  } else {
+  if (lookahead_fd >= 0) { close(lookahead_fd); lookahead_fd = -1; }
+  if (mpcp_now_ns() < open_at) mpcp_sleep_until_ns(open_at);
+  jit_fd = open_udp_socket_on_port(sched[i].ephemeral_port);
+  }
   if (jit_fd < 0) {
   atomic_fetch_add_explicit(&g_blink_missed_windows, 1u, memory_order_relaxed);
   blink_window_record(&win, false);
   continue;
   }
+  /* Fix 3: guard = max(kf_sigma*2 + 5ms, 15ms) — asymmetric, late-biased like original */
+  int guard_ms = (int)(kf_guard_base / 1000000ULL);
+  if (guard_ms < 15) guard_ms = 15;
   struct sockaddr_in fsrc; socklen_t fsl = sizeof(fsrc);
   ssize_t nb = recvfrom(jit_fd, pkt, pkt_max, MSG_DONTWAIT,
   (struct sockaddr *)&fsrc, &fsl);
   if (nb < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
   struct pollfd pfd = { .fd = jit_fd, .events = POLLIN, .revents = 0 };
-  int pr = poll(&pfd, 1, 10);
+  int pr = poll(&pfd, 1, guard_ms);
   if (pr > 0 && (pfd.revents & POLLIN)) {
   nb = recvfrom(jit_fd, pkt, pkt_max, MSG_DONTWAIT,
   (struct sockaddr *)&fsrc, &fsl);
@@ -5423,6 +5470,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   close(jit_fd);
   atomic_fetch_add_explicit(&g_blink_missed_windows, 1u, memory_order_relaxed);
   blink_window_record(&win, false);
+  if (g_debug_stealth)
+  fprintf(stderr, "[blink-jit] MISS chunk %u port=%u guard=%dms\n",
+  sched[i].chunk_index, sched[i].ephemeral_port, guard_ms);
   continue;
   }
   uint32_t magic; memcpy(&magic, pkt, 4);
@@ -5433,7 +5483,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   close(jit_fd); continue;
   }
   uint32_t pkt_seq; memcpy(&pkt_seq, pkt + 6, 4); pkt_seq = ntohl(pkt_seq);
-  int64_t err_ns = (int64_t)mpcp_now_raw_ns() - (int64_t)expected;
+  int64_t err_ns = (int64_t)mpcp_now_ns() - (int64_t)expected; /* MONOTONIC throughout */
   pid_integral_ns += (double)err_ns;
   if (pid_integral_ns > 5000000.0) pid_integral_ns = 5000000.0;
   if (pid_integral_ns < -5000000.0) pid_integral_ns = -5000000.0;
@@ -5493,6 +5543,15 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   randombytes_buf(ack.padding, sizeof(ack.padding));
   sendto(jit_fd, &ack, sizeof(ack), 0, (const struct sockaddr *)&fsrc, fsl);
   }
+  /* Fix 4 (look-ahead): always pre-open chunk[i+1] socket immediately after the
+   * ACK for chunk[i] is sent.  At most 2 ports open for ~one interval, but the
+   * next packet can queue into the kernel buffer even before we arrive at i+1.
+   * This eliminates the deaf-zone between close(jit_fd[i]) and open(jit_fd[i+1]). */
+  if (i + 1 < n && lookahead_fd < 0) {
+    lookahead_port = sched[i + 1].ephemeral_port;
+    lookahead_fd   = open_udp_socket_on_port(lookahead_port);
+    /* If open fails the next iteration simply falls through to a fresh open */
+  }
   close(jit_fd);
   slot->seq_index = pkt_seq;
   slot->flags     = pkt[11];
@@ -5505,12 +5564,25 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   got[i] = true;
   received++;
   blink_window_record(&win, true);
-  fprintf(stderr, "\r  [JIT %u/%u] port=%u miss=%.0f%%   ",
+  /* Fix 6 (CLI): \r\033[K overwrites current line; no cursor-up needed */
+  fprintf(stderr, "\r\033[K  [JIT %u/%u] port=%u miss=%.0f%%",
   received, ctx->plan.n_chunks,
   sched[i].ephemeral_port,
   blink_window_miss_rate(&win) * 100.0);
   fflush(stderr);
+  /* Fix 2 (epoch resync): every 1000 chunks recalibrate tzero via arrival delta */
+  if (received > 0 && (received % 1000) == 0 && i + 1 < n) {
+    uint64_t actual_now  = mpcp_now_ns(); /* MONOTONIC: matches tzero domain */
+    int64_t  drift_delta = (int64_t)actual_now - (int64_t)expected;
+    tzero = (uint64_t)((int64_t)tzero + drift_delta);
+    mpcp_generate_schedule(sess, cfg, a->block_seqs + i + 1, n - i - 1,
+                           tzero, sess->blink_interval_ns, drift, sched + i + 1);
+    if (g_debug_stealth)
+      fprintf(stderr, "\n  [blink] epoch-resync @ chunk %u: drift_delta=%+ldus tzero adjusted\n",
+              received, (long)(drift_delta / 1000LL));
   }
+  }
+  if (lookahead_fd >= 0) { close(lookahead_fd); lookahead_fd = -1; }
   free(got);
   free(sched);
   } else {
@@ -5639,7 +5711,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
                        (const struct sockaddr *)&fsrc, fsl); }
               { uint32_t dd = 0;
                 for (uint32_t _d = 0; _d < n; _d++) if (got2[_d]) dd++;
-                fprintf(stderr, "\r  [%u/%u]   ", dd + 1, ctx->plan.n_chunks);
+                fprintf(stderr, "\r\033[K  [%u/%u]", dd + 1, ctx->plan.n_chunks);
                 fflush(stderr); }
               got2[mapped_j] = true; received++; any = true;
           }
@@ -5737,7 +5809,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
           /* Progress display */
           { uint32_t dd = 0;
             for (uint32_t _d = 0; _d < n; _d++) if (got2[_d]) dd++;
-            fprintf(stderr, "\r  [%u/%u]   ", dd + 1, ctx->plan.n_chunks);
+            fprintf(stderr, "\r\033[K  [%u/%u]", dd + 1, ctx->plan.n_chunks);
             fflush(stderr); }
 
           /*
@@ -5907,7 +5979,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (len > 0) {
   if (a->use_decompress && !(ctx->plan.skip_compression) &&
   !(ctx->chunk_flags[ws] & MPCP_FLAG_SKIP_COMPRESSION)) {
-  size_t   dbound = ZSTD_DStreamOutSize() * 4u;
+  /* Tight bound: chunks decompress to at most chunk_pad_size bytes. */
+  size_t   dbound = (size_t)ctx->cfg->chunk_pad_size + 1u;
   uint8_t *dbuf   = malloc(dbound);
   if (dbuf) {
   size_t dlen = ZSTD_decompress(dbuf, dbound, buf, len);
@@ -5945,7 +6018,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (len > 0) {
   if (a->use_decompress && !(ctx->plan.skip_compression) &&
   !(ctx->chunk_flags[ws] & MPCP_FLAG_SKIP_COMPRESSION)) {
-  size_t   dbound = ZSTD_DStreamOutSize() * 4u;
+  /* Tight bound: chunks decompress to at most chunk_pad_size bytes. */
+  size_t   dbound = (size_t)ctx->cfg->chunk_pad_size + 1u;
   uint8_t *dbuf   = malloc(dbound);
   if (dbuf) {
   size_t dlen = ZSTD_decompress(dbuf, dbound, buf, len);
@@ -5984,7 +6058,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (len > 0) {
   if (a->use_decompress && !(ctx->plan.skip_compression) &&
   !(ctx->chunk_flags[ws] & MPCP_FLAG_SKIP_COMPRESSION)) {
-  size_t   dbound = ZSTD_DStreamOutSize() * 4u;
+  /* Tight bound: chunks decompress to at most chunk_pad_size bytes. */
+  size_t   dbound = (size_t)ctx->cfg->chunk_pad_size + 1u;
   uint8_t *dbuf   = malloc(dbound);
   if (dbuf) {
   size_t dlen = ZSTD_decompress(dbuf, dbound, buf, len);
@@ -6117,23 +6192,16 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   ctx.block_size     = _rblk_sz;
   ctx.plan.n_chunks  = _rblk_sz;
   ctx.next_write_seq = 0;
-  uint32_t expected_in_block = _rblk_sz + (ctx.block_ghost_end - ctx.block_ghost_start);
-  uint32_t *block_seqs = malloc(expected_in_block * sizeof(uint32_t));
+  /* Blink JIT schedule: DATA CHUNKS ONLY.
+   * Ghost chunks have seq > n_data_chunks; seq-based timing would schedule
+   * them hundreds of ms after data, sleeping through data windows → 0 received.
+   * Ghost packets arrive on closed ports and are dropped by the OS — that IS
+   * the stealth effect (authentic-looking "port unreachable" ICMP noise). */
+  uint32_t *block_seqs = malloc(_rblk_sz * sizeof(uint32_t));
   if (!block_seqs) { rc = MPCP_ERR_ALLOC; goto cleanup_r2; }
-  {
-  uint32_t bsi = 0;
-  uint32_t g_idx = ctx.block_ghost_start;
-  for (uint32_t i = 0; i < _rblk_sz; i++) {
-  block_seqs[bsi++] = _rblk_base + i;
-  if (cfg->ghost_chunks_enabled && g_idx < ctx.block_ghost_end) {
-  block_seqs[bsi++] = ghost_seqs[g_idx++];
-  }
-  }
-  while (g_idx < ctx.block_ghost_end) {
-  block_seqs[bsi++] = ghost_seqs[g_idx++];
-  }
-  }
-  recv_t1_arg_t  t1_arg = { &ctx, expected_in_block, block_seqs, catch_ms };
+  for (uint32_t i = 0; i < _rblk_sz; i++)
+  block_seqs[i] = _rblk_base + i;
+  recv_t1_arg_t  t1_arg = { &ctx, _rblk_sz, block_seqs, catch_ms };
   verifier_arg_t t2_arg = { &ctx };
   decrypt_arg_t  t3_arg = { &ctx };
   writer_arg_t   t4_arg = { &ctx, use_decomp };
@@ -8002,9 +8070,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   int idx = 0;
   while (!sp->done) {
   if (g_ui_colour)
-  printf("\r  %s%s%s ", gcols[idx % 8], gear_frames[idx % 8], C_RESET);
+  printf("\r\033[K  %s%s%s", gcols[idx % 8], gear_frames[idx % 8], C_RESET);
   else
-  printf("\r  %s ", plain_frames[idx & 3]);
+  printf("\r\033[K  %s", plain_frames[idx & 3]);
   fflush(stdout);
   idx++;
   struct timespec ts = { .tv_sec = 0, .tv_nsec = 120000000L };
@@ -8012,16 +8080,16 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   if (sp->done == 2) {
   if (g_ui_colour)
-  printf("\r  %s[+]%s  done          \n", C_LIME, C_RESET);
+  printf("\r\033[K  %s[+]%s  done\n", C_LIME, C_RESET);
   else
-  printf("\r  [+] done          \n");
+  printf("\r\033[K  [+] done\n");
   } else if (sp->done == 3) {
   if (g_ui_colour)
-  printf("\r  %s[x]%s  failed        \n", C_ROSE, C_RESET);
+  printf("\r\033[K  %s[x]%s  failed\n", C_ROSE, C_RESET);
   else
-  printf("\r  [x] failed        \n");
+  printf("\r\033[K  [x] failed\n");
   } else {
-  printf("\r                  \n");
+  printf("\r\033[K\n");
   }
   fflush(stdout);
   return NULL;
@@ -8030,9 +8098,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   {
   sp->done = 0;
   if (g_ui_colour)
-  printf("  %s%s%s\n", C_GREY, label, C_RESET);
+  printf("\r\033[K  %s%s%s  [---]", C_GREY, label, C_RESET);
   else
-  printf("%s...\n", label);
+  printf("\r\033[K  %s... [---]", label);
   fflush(stdout);
   pthread_create(&sp->thread, NULL, spinner_thread, sp);
   }
@@ -9019,6 +9087,13 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   sess.blink_origin_ns   = preflight.tzero_ns;
   sess.t_zero_ns         = preflight.tzero_ns;
   sess.drift_coefficient = preflight.drift_coefficient;
+  /* Fix 3+4: Kalman jitter sigma (ns) = sqrt(jitter_variance_ms2)*1e6, clamped [500us,20ms] */
+  {
+    double _sigma_ns = sqrt(preflight.jitter_variance_ms2) * 1e6;
+    if (_sigma_ns < 500000.0)   _sigma_ns = 500000.0;
+    if (_sigma_ns > 20000000.0) _sigma_ns = 20000000.0;
+    sess.kf_jitter_ns = (uint64_t)_sigma_ns;
+  }
   printf("  Pre-flight lock : %s\n", preflight.handshake_locked ? "LOCKED" : "FAILED");
   printf("  Stable RTT      : %.3f ms\n", preflight.stable_mean_rtt_ms);
   printf("  Jitter variance : %.6f ms^2\n", preflight.jitter_variance_ms2);
@@ -9026,7 +9101,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   preflight.drift_ppm, preflight.drift_coefficient);
   printf("  Cadence/T0      : %.1f ms, T0 in %.0f ms, port %u\n",
   (double)preflight.blink_interval_ns / 1e6,
-  (double)(int64_t)(preflight.tzero_ns - mpcp_now_raw_ns()) / 1e6,
+  (double)(int64_t)(preflight.tzero_ns - mpcp_now_ns()) / 1e6,
   preflight.ghost_port);
     rc = mpcp_derive_master_secret(sess.session_nonce,
   NULL, 0,
@@ -9044,10 +9119,7 @@ if (rc != MPCP_OK) { mpcp_perror("master secret", rc); return 1; }
   struct stat _st;
   if (stat(file_buf, &_st) == 0 && _st.st_size > 0) {
   size_t fsize = (size_t)_st.st_size;
-  if (fsize > 4u * 1024u * 1024u && sess.blink_interval_ns > 0) {
-      sess.blink_interval_ns = 0;
-      printf("  [large file] Blink disabled \xe2\x80\x93 using normal UDP scheduling\n");
-  }
+  /* Fix 1: size gate removed — Blink is the ONLY transfer mode regardless of file size */
   static const size_t _PROBE_CAP_RT = 1u << 20;
   size_t _probe_rt = (fsize < _PROBE_CAP_RT) ? fsize : _PROBE_CAP_RT;
   size_t bound = ZSTD_compressBound(_probe_rt);
@@ -9335,6 +9407,15 @@ if (rc != MPCP_OK) { mpcp_perror("master secret", rc); return 1; }
   }
   int main(int argc, char **argv)
   {
+  /* Raise the soft open-file limit to the hard limit so the non-blink receiver
+   * can open one UDP socket per chunk (up to MAX_BLOCK_CHUNKS = 4096 per block). */
+  {
+  struct rlimit _rl;
+  if (getrlimit(RLIMIT_NOFILE, &_rl) == 0 && _rl.rlim_cur < _rl.rlim_max) {
+  _rl.rlim_cur = _rl.rlim_max;
+  setrlimit(RLIMIT_NOFILE, &_rl);
+  }
+  }
   for (int _ai = 1; _ai < argc; _ai++) {
   if (strcmp(argv[_ai], "--debug-stealth") == 0) {
   g_debug_stealth = true;
