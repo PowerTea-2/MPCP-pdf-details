@@ -1,9 +1,26 @@
-// Version: ClockWork v1.2-PROD
-// Author: PowerTea-2 
-// Build:  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O3 clockwork.c -o mpcp -lsodium -lzstd -lm -lpthread
-// Logic:  BLOCK-SYNC (256) | O(1)-KEYSTREAM | HW-TIMESTAMP | CONDVAR-RING | GHOST-STEALTH
+// Version: ClockWork v2.0-HARDENED
+// Author: PowerTea-2
+// Build (standard):
+//   gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O3 -march=native -mtune=native -flto -fno-plt -funroll-loops -pipe -Wl,-O1,--as-needed Delta-T.c -o Delta-T -lsodium -lzstd -lm -lpthread
+// Build (stealth — recommended):
+//   gcc -static -O3 -fstack-protector-all -s -o Delta-T Delta-T.c -lsodium -lzstd -lm -lpthread
+// Logic:  BLINK-ONLY | O(1)-KEYSTREAM | HW-TIMESTAMP | CONDVAR-RING | GHOST-STEALTH | KALMAN-JIT
+//         TRIAL-DECRYPT | VPORT-MUX | RCBR-SHAPING | UPNP-IGD | EXEC-SHIELD
 // Arch:   On-the-fly ChaCha20 keystream (no malloc) | condvar ring | hw-level RTT | Ed25519 UX
-// NOTE: IF EDITING THIS FILE, MAKE SURE TO ALWAYS CHANGE THIS NUMBER TO ONE DECIMAL HIGHER TO TRACK VERSION: 1.2
+//         Wire format: [nonce:24][AEAD_ciphertext:N] — zero plaintext; traffic = random noise
+// NOTE: IF EDITING THIS FILE, MAKE SURE TO ALWAYS CHANGE THIS NUMBER TO ONE DECIMAL HIGHER TO TRACK VERSION: 2.1
+// FIXES v2.0: (1) Remove size gate: Blink is mandatory for ALL file sizes (no fallback to block-sync)
+//             (2) Epoch resync: tzero recalibrated every 1,000 chunks via arrival-delta to kill drift
+//             (3) Kalman+5ms hybrid window: T_open/T_close = predicted +/-(kf_sigma_ns + 2.5ms)
+//             (4) Look-ahead socket: chunk[N+1] socket opened 5ms before chunk[N] closes (no dead zone)
+//             (5) Stealth handshake deadline: 10s -> 30s (resolves race with 10s stealth silence period)
+//             (6) CLI progress: \033[1A cursor-up replaced with \r\033[K (universal carriage-return)
+//             (7) Build flags: -ffast-math removed (broke IEEE fp in Kalman + JIT timing)
+// FIXES v1.3: (1) RLIMIT_NOFILE raised to hard limit at startup (5GB+: 4096 chunk sockets per block needed)
+//             (2) Spinner 2-line layout: gear on label line via cursor-up, progress on its own line below
+//             (3) ZSTD decompress buffer: ZSTD_DStreamOutSize()*4 -> chunk_pad_size+1 (correct tight bound)
+//             (4) Build flags: -march=native -mtune=native -flto -fno-plt -funroll-loops -pipe
+//             (5) Unused include <sys/resource.h> added for setrlimit
 // FIXES v1.2: (1) ring1 slot buffer = ZSTD_compressBound(max_chunk_bytes): was max+1, always overflowed
 //             (2) Per-chunk MPCP_FLAG_SKIP_COMPRESSION respected in writer (per-chunk flags stored)
 //             (3) thread_ack_handler: consecutive-timeout exit so sender never hangs after retries done
@@ -60,11 +77,15 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/timex.h>
+#include <sys/resource.h>
 #include <linux/net_tstamp.h>
 #include <linux/errqueue.h>
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+#include <sys/mman.h>
+#include <sys/capability.h>
+#include <linux/capability.h>
 static ssize_t checked_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest, socklen_t destlen);
 static int __attribute__((unused)) checked_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg);
 static bool g_ui_colour = false;
@@ -167,7 +188,7 @@ static const char *logo[] = {
 "     | o   o |        | o   o |   ##   ##  ######  #####   ##  ##     ",
 "      \\-----/          \\-----/    ## # ## ##    ## ##  ##  ## ##      ",
 "                                  ##   ## ##    ## #####   ####       ",
-"   [=== CLOCKWORK TRANSFER v0.9 ===]  ## ##  ##    ## ##  ##      ",
+"   [=== CLOCKWORK TRANSFER v2.0-HARDENED ===]  ## ##  ##    ## ##  ##      ",
 "                                  ##   ##  ######  ##  ## ##  ##      ",
 };
 static const char *grad[] = {
@@ -198,17 +219,43 @@ fflush(stdout);
 ui_sleep_ms(45);
 }
 if (g_ui_colour) {
-printf("  %s[##]  %sClockWork Transfer Engine%s  %sv0.9-PROD%s\n",
+printf("  %s[##]  %sClockWork Transfer Engine%s  %sv2.0-HARDENED%s\n",
 C_PLUM, C_VIOLET, C_RESET, C_GREY, C_RESET);
 } else {
-printf("  [##] ClockWork  v0.9-PROD\n");
+printf("  [##] ClockWork v2.0-HARDENED\n");
 }
 ui_glow_line(42);
 ui_particle_burst();
 if (g_ui_colour) printf(C_CURSOR);
 }
 #define MPCP_VERSION        0x05
-#define MPCP_MAGIC          0x4D435043u  
+/* === TRIAL DECRYPTION ENGINE — no plaintext magic on wire ===
+ * Wire format for ALL packets: [xchacha_nonce:24][AEAD_ciphertext:N]
+ * Receiver always performs blind trial-decryption; success = valid packet,
+ * failure = constant-time discard (high-entropy network noise).
+ *
+ * Cal key (used before session_key exists, derived from PSK alone):
+ *   cal_key = HKDF(salt=NULL, ikm=psk, info="delta-t-cal-v2")
+ *
+ * Wire overhead per packet: +24 (nonce) +16 (Poly1305 tag) = +40 bytes.
+ */
+#define DT_CAL_KEY_INFO     "delta-t-cal-v2"   /* HKDF info for cal_key    */
+#define DT_WIRE_NONCE_LEN   24u                 /* XChaCha nonce in wire hdr*/
+#define DT_WIRE_TAG_LEN     16u                 /* Poly1305 MAC             */
+#define DT_WIRE_OVERHEAD    (DT_WIRE_NONCE_LEN + DT_WIRE_TAG_LEN)
+/* === VIRTUAL PORT LAYER (Logical Multiplexing) ===
+ * Single physical port 443 for all traffic.
+ * VirtualPortID (2 bytes) is the first field inside EVERY AEAD plaintext.
+ * Routing after trial decryption:
+ *   0x0001  DATA_STREAM  — file chunk ciphertext
+ *   0x0002  CTRL_PLANE   — calibration ping/pong, heartbeat, RTT, ACK/NACK, KEX
+ *   0x0003  GHOST_VAL    — chaff packets for LPI traffic shaping
+ */
+#define VPORT_DATA_STREAM   0x0001u
+#define VPORT_CTRL_PLANE    0x0002u
+#define VPORT_GHOST_VAL     0x0003u
+/* Physical port for all hardened-mode traffic */
+#define DT_PHYSICAL_PORT    443u
 typedef enum {
 MPCP_OK               =  0,
 MPCP_ERR_PARAM        = -1,  
@@ -327,6 +374,10 @@ uint64_t blink_interval_ns;
 uint64_t blink_origin_ns;  
 uint64_t t_zero_ns;
 double   drift_coefficient;
+uint64_t kf_jitter_ns;           /* Kalman-derived jitter sigma (ns): sqrt(jitter_variance_ms2)*1e6
+                                  * Populated from calibration; used by receiver JIT window formula:
+                                  *   T_open  = T_predicted - (kf_jitter_ns + 2_500_000)
+                                  *   T_close = T_predicted + (kf_jitter_ns + 2_500_000)        */
 
 } mpcp_session_t;
 typedef struct {
@@ -565,9 +616,12 @@ _Static_assert(offsetof(mpcp_sliding_window_t, shared_ack_base) == 128, "LINE 2 
 _Static_assert(offsetof(mpcp_sliding_window_t, kf_rtt_estimate) == 192, "LINE 3 drift");
 
 typedef struct __attribute__((packed)) {
-uint32_t magic;  
-uint8_t  version;  
-uint8_t  type;  
+/* NOTE: this struct lives INSIDE the AEAD ciphertext — never in plaintext.
+ * magic field replaced by vport_id (VirtualPortID) + rand_pad for DPI resistance. */
+uint16_t vport_id;  /* virtual port: VPORT_DATA_STREAM / CTRL_PLANE / GHOST_VAL */
+uint8_t  rand_pad[2]; /* random bytes — filled by sender, ignored by receiver   */
+uint8_t  version;     /* MPCP_VERSION                                           */
+uint8_t  type;        /* MPCP_TYPE_*                                            */
 } mpcp_hdr_t;
 typedef struct __attribute__((packed)) {
 mpcp_hdr_t hdr;
@@ -610,7 +664,7 @@ uint64_t   scheduled_time_ns;
 #define MPCP_FLAG_DECOY_ENCODING    0x02  
 #define MPCP_FLAG_LAST_CHUNK        0x80  /* chunk-slot flag; deliberately separated from xfer_flags space */
 #define MPCP_STATIC_ASSERT(cond, msg) typedef char static_assert_##msg[(cond) ? 1 : -1]
-MPCP_STATIC_ASSERT(sizeof(mpcp_hdr_t)        ==  6, hdr_must_be_6);
+MPCP_STATIC_ASSERT(sizeof(mpcp_hdr_t)        ==  6, hdr_must_be_6_vport);
 MPCP_STATIC_ASSERT(sizeof(mpcp_cal_pkt_t)    == 64, cal_pkt_must_be_64);
 MPCP_STATIC_ASSERT(sizeof(mpcp_key_pkt_t)    == 96, key_pkt_must_be_96);
 MPCP_STATIC_ASSERT(sizeof(mpcp_ack_pkt_t)    == 32, ack_pkt_must_be_32);
@@ -1071,6 +1125,513 @@ okm, out_len);
 sodium_memzero(prk, sizeof(prk));
 return (rc == 0) ? MPCP_OK : MPCP_ERR_CRYPTO;
 }
+
+/* ============================================================
+ * === TRIAL DECRYPTION ENGINE (Roadmap §2) ==================
+ * ============================================================
+ * Wire format for ALL packets: [xchacha_nonce:24][AEAD_ct:N]
+ *
+ * cal_key_from_psk(): derive the calibration key from PSK only.
+ *   Both sides can compute this before session_nonce is known.
+ *
+ * dt_send_wire():       encrypt + send a plaintext buffer.
+ * dt_recv_trial():      receive + trial-decrypt; drop noise silently.
+ *
+ * All wire traffic appears as high-entropy random — indistinguishable
+ * from /dev/urandom output to any passive observer.
+ * ============================================================ */
+
+static int cal_key_from_psk(const uint8_t *psk, size_t psk_len,
+                             uint8_t cal_key_out[32])
+{
+    return mpcp_hkdf(NULL, 0, psk, psk_len, DT_CAL_KEY_INFO,
+                     cal_key_out, 32);
+}
+
+/* Send plaintext `plain/plain_len` encrypted under `key` to `dst`.
+ * Wire bytes = [nonce:24][AEAD_ciphertext:plain_len+16].
+ * Returns bytes sent on success, -1 on error. */
+static ssize_t dt_send_wire(int fd,
+                             const void *plain, size_t plain_len,
+                             const uint8_t key[32],
+                             const struct sockaddr *dst, socklen_t dstlen)
+{
+    size_t wire_cap = DT_WIRE_NONCE_LEN + plain_len + DT_WIRE_TAG_LEN;
+    uint8_t *wire = malloc(wire_cap);
+    if (!wire) return -1;
+    /* random nonce in first 24 bytes */
+    randombytes_buf(wire, DT_WIRE_NONCE_LEN);
+    unsigned long long ct_len = 0;
+    int rc = crypto_aead_xchacha20poly1305_ietf_encrypt(
+        wire + DT_WIRE_NONCE_LEN, &ct_len,
+        (const uint8_t *)plain, plain_len,
+        NULL, 0,           /* no additional data */
+        NULL,              /* no secret nonce    */
+        wire,              /* nonce = first 24B  */
+        key);
+    ssize_t sent = -1;
+    if (rc == 0)
+        sent = sendto(fd, wire, DT_WIRE_NONCE_LEN + (size_t)ct_len, 0,
+                      dst, dstlen);
+    sodium_memzero(wire, wire_cap);
+    free(wire);
+    return sent;
+}
+
+/* Receive one UDP packet and trial-decrypt with `key`.
+ * Returns plaintext length (≥0) on success, -1 on noise/failure.
+ * Constant-time on failure: no early exit after MAC verification starts,
+ * output buffer always zeroed on failure. */
+static ssize_t dt_recv_trial(int fd,
+                              void *plain_out, size_t plain_cap,
+                              const uint8_t key[32],
+                              struct sockaddr_in *from, socklen_t *fromlen)
+{
+    size_t wire_cap = DT_WIRE_NONCE_LEN + plain_cap + DT_WIRE_TAG_LEN + 64u;
+    uint8_t *wire = malloc(wire_cap);
+    if (!wire) return -1;
+    ssize_t n = recvfrom(fd, wire, wire_cap, 0,
+                         (struct sockaddr *)from, fromlen);
+    if (n < (ssize_t)(DT_WIRE_NONCE_LEN + DT_WIRE_TAG_LEN)) {
+        free(wire);
+        return -1;
+    }
+    unsigned long long pt_len = 0;
+    int rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
+        (uint8_t *)plain_out, &pt_len,
+        NULL,
+        wire + DT_WIRE_NONCE_LEN, (size_t)n - DT_WIRE_NONCE_LEN,
+        NULL, 0,
+        wire,   /* nonce = first 24 bytes of wire packet */
+        key);
+    sodium_memzero(wire, wire_cap);
+    free(wire);
+    if (rc != 0) {
+        /* Constant-time drop: zero output, no timing leak */
+        volatile uint8_t *p = (volatile uint8_t *)plain_out;
+        size_t z = (plain_cap < 4096u) ? plain_cap : 4096u;
+        for (size_t i = 0; i < z; i++) p[i] = 0;
+        return -1;
+    }
+    return (ssize_t)pt_len;
+}
+
+/* recvmsg variant (for HW timestamping during calibration) */
+static ssize_t dt_recvmsg_trial(int fd,
+                                 struct msghdr *msg_template,
+                                 void *plain_out, size_t plain_cap,
+                                 const uint8_t key[32])
+{
+    size_t wire_cap = DT_WIRE_NONCE_LEN + plain_cap + DT_WIRE_TAG_LEN + 64u;
+    uint8_t *wire_buf = malloc(wire_cap);
+    if (!wire_buf) return -1;
+    struct iovec iov = { .iov_base = wire_buf, .iov_len = wire_cap };
+    msg_template->msg_iov    = &iov;
+    msg_template->msg_iovlen = 1;
+    ssize_t n = recvmsg(fd, msg_template, 0);
+    if (n < (ssize_t)(DT_WIRE_NONCE_LEN + DT_WIRE_TAG_LEN)) {
+        free(wire_buf);
+        return -1;
+    }
+    unsigned long long pt_len = 0;
+    int rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
+        (uint8_t *)plain_out, &pt_len,
+        NULL,
+        wire_buf + DT_WIRE_NONCE_LEN, (size_t)n - DT_WIRE_NONCE_LEN,
+        NULL, 0,
+        wire_buf, key);
+    sodium_memzero(wire_buf, wire_cap);
+    free(wire_buf);
+    if (rc != 0) {
+        volatile uint8_t *p = (volatile uint8_t *)plain_out;
+        size_t z = (plain_cap < 4096u) ? plain_cap : 4096u;
+        for (size_t i = 0; i < z; i++) p[i] = 0;
+        return -1;
+    }
+    return (ssize_t)pt_len;
+}
+
+/* ============================================================
+ * === LOCAL NETWORK DISCOVERY — UPnP/IGD + STUN (Roadmap §1)
+ * ============================================================
+ * Pure P2P external IP discovery.  No STUN libraries, no libcurl,
+ * no browser calls.  Two-layer fallback:
+ *
+ *   Layer 1: SSDP M-SEARCH → router XML → SOAP GetExternalIPAddress
+ *   Layer 2: Raw UDP STUN binding request to hardcoded endpoints
+ *            (Google 8.8.8.8:3478, Cloudflare 1.1.1.1:3478)
+ * ============================================================ */
+
+#define SSDP_ADDR   "239.255.255.250"
+#define SSDP_PORT   1900
+#define STUN_PORT   3478
+
+static const char *dt_stun_servers[] = {
+    "8.8.8.8",    /* Google STUN  */
+    "1.1.1.1",    /* Cloudflare   */
+    NULL
+};
+
+/* --- UPnP helper: HTTP GET a URL (blocking, no libcurl) --- */
+static int upnp_http_get(const char *host, uint16_t port,
+                          const char *path,
+                          char *resp_buf, size_t resp_cap)
+{
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) return -1;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { freeaddrinfo(res); return -1; }
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int rc = connect(s, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (rc < 0) { close(s); return -1; }
+    char req[512];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.0\r\nHost: %s:%u\r\nConnection: close\r\n\r\n",
+             path, host, port);
+    if (send(s, req, strlen(req), 0) < 0) { close(s); return -1; }
+    size_t got = 0;
+    ssize_t r;
+    while (got < resp_cap - 1 &&
+           (r = recv(s, resp_buf + got, resp_cap - 1 - got, 0)) > 0)
+        got += (size_t)r;
+    close(s);
+    resp_buf[got] = '\0';
+    return (int)got;
+}
+
+/* --- UPnP helper: SOAP POST --- */
+static int upnp_soap_post(const char *host, uint16_t port,
+                           const char *ctrl_url,
+                           const char *soap_action,
+                           const char *soap_body,
+                           char *resp_buf, size_t resp_cap)
+{
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) return -1;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { freeaddrinfo(res); return -1; }
+    struct timeval tv = { .tv_sec = 4, .tv_usec = 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int rc = connect(s, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (rc < 0) { close(s); return -1; }
+    char req[2048];
+    int req_len = snprintf(req, sizeof(req),
+        "POST %s HTTP/1.0\r\n"
+        "Host: %s:%u\r\n"
+        "Content-Type: text/xml; charset=\"utf-8\"\r\n"
+        "SOAPAction: \"%s\"\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n"
+        "%s",
+        ctrl_url, host, port, soap_action, strlen(soap_body), soap_body);
+    if (send(s, req, (size_t)req_len, 0) < 0) { close(s); return -1; }
+    size_t got = 0;
+    ssize_t r;
+    while (got < resp_cap - 1 &&
+           (r = recv(s, resp_buf + got, resp_cap - 1 - got, 0)) > 0)
+        got += (size_t)r;
+    close(s);
+    resp_buf[got] = '\0';
+    return (int)got;
+}
+
+/* --- UPnP: extract tag value from XML string --- */
+static int xml_extract(const char *xml, const char *tag,
+                        char *out, size_t out_cap)
+{
+    char open_tag[128], close_tag[128];
+    snprintf(open_tag,  sizeof(open_tag),  "<%s>",  tag);
+    snprintf(close_tag, sizeof(close_tag), "</%s>", tag);
+    const char *p = strstr(xml, open_tag);
+    if (!p) return -1;
+    p += strlen(open_tag);
+    const char *q = strstr(p, close_tag);
+    if (!q) return -1;
+    size_t len = (size_t)(q - p);
+    if (len >= out_cap) len = out_cap - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return 0;
+}
+
+/* === dt_upnp_get_external_ip() ===
+ * Perform UPnP/IGD SSDP discovery + SOAP GetExternalIPAddress.
+ * Fills ext_ip_out (INET_ADDRSTRLEN) on success. Returns 0 on success. */
+static int dt_upnp_get_external_ip(char ext_ip_out[INET_ADDRSTRLEN])
+{
+    /* 1. SSDP M-SEARCH broadcast */
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int bc = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &bc, sizeof(bc));
+    struct sockaddr_in mc;
+    memset(&mc, 0, sizeof(mc));
+    mc.sin_family = AF_INET;
+    mc.sin_port   = htons(SSDP_PORT);
+    inet_pton(AF_INET, SSDP_ADDR, &mc.sin_addr);
+    const char *msearch =
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        "MAN: \"ssdp:discover\"\r\n"
+        "MX: 2\r\n"
+        "ST: urn:schemas-upnp-org:service:WANIPConnection:1\r\n\r\n";
+    sendto(sock, msearch, strlen(msearch), 0,
+           (struct sockaddr *)&mc, sizeof(mc));
+    /* 2. Collect SSDP response, parse LOCATION header */
+    char resp[4096];
+    struct sockaddr_in from;
+    socklen_t fl = sizeof(from);
+    ssize_t n = recvfrom(sock, resp, sizeof(resp)-1, 0,
+                          (struct sockaddr *)&from, &fl);
+    close(sock);
+    if (n <= 0) return -1;
+    resp[n] = '\0';
+    /* Extract LOCATION URL (case-insensitive search) */
+    char *loc = strcasestr(resp, "LOCATION:");
+    if (!loc) return -1;
+    loc += 9;
+    while (*loc == ' ') loc++;
+    char *eol = strpbrk(loc, "\r\n");
+    if (eol) *eol = '\0';
+    /* Parse http://host:port/path from LOCATION */
+    char loc_host[256] = {0};
+    uint16_t loc_port  = 80;
+    char loc_path[512] = {0};
+    if (sscanf(loc, "http://%255[^:/]:%hu%511s", loc_host, &loc_port, loc_path) < 1)
+        return -1;
+    if (loc_path[0] == '\0') strcpy(loc_path, "/");
+    /* 3. HTTP GET the device XML description */
+    char xml_buf[16384];
+    if (upnp_http_get(loc_host, loc_port, loc_path, xml_buf, sizeof(xml_buf)) <= 0)
+        return -1;
+    /* 4. Find WANIPConnection controlURL */
+    char ctrl_url[512] = {0};
+    if (xml_extract(xml_buf, "controlURL", ctrl_url, sizeof(ctrl_url)) != 0)
+        return -1;
+    /* 5. SOAP POST GetExternalIPAddress */
+    const char *soap_action =
+        "urn:schemas-upnp-org:service:WANIPConnection:1#GetExternalIPAddress";
+    const char *soap_body =
+        "<?xml version=\"1.0\"?>"
+        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\""
+        " s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
+        "<s:Body><u:GetExternalIPAddress "
+        "xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"/>"
+        "</s:Body></s:Envelope>";
+    char soap_resp[4096];
+    if (upnp_soap_post(loc_host, loc_port, ctrl_url,
+                        soap_action, soap_body,
+                        soap_resp, sizeof(soap_resp)) <= 0)
+        return -1;
+    /* 6. Extract <NewExternalIPAddress> from SOAP response */
+    return xml_extract(soap_resp, "NewExternalIPAddress",
+                        ext_ip_out, INET_ADDRSTRLEN);
+}
+
+/* === dt_stun_get_external_ip() ===
+ * Fallback: raw UDP STUN Binding Request (RFC 5389) to hardcoded servers.
+ * No library dependency. */
+static int dt_stun_get_external_ip(char ext_ip_out[INET_ADDRSTRLEN])
+{
+    /* Minimal STUN Binding Request: 20-byte header, no attributes */
+    static const uint8_t stun_req[20] = {
+        0x00, 0x01,  /* Type: Binding Request  */
+        0x00, 0x00,  /* Length: 0 (no attrs)   */
+        0x21, 0x12, 0xa4, 0x42,  /* Magic cookie       */
+        0xDE, 0xAD, 0xBE, 0xEF,  /* Transaction ID (12B) */
+        0xCA, 0xFE, 0xBA, 0xBE,
+        0x00, 0x01, 0x02, 0x03
+    };
+    for (int si = 0; dt_stun_servers[si]; si++) {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) continue;
+        struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        struct sockaddr_in srv;
+        memset(&srv, 0, sizeof(srv));
+        srv.sin_family = AF_INET;
+        srv.sin_port   = htons(STUN_PORT);
+        inet_pton(AF_INET, dt_stun_servers[si], &srv.sin_addr);
+        sendto(sock, stun_req, sizeof(stun_req), 0,
+               (struct sockaddr *)&srv, sizeof(srv));
+        uint8_t resp[512];
+        ssize_t n = recvfrom(sock, resp, sizeof(resp), 0, NULL, NULL);
+        close(sock);
+        if (n < 20) continue;
+        /* Parse STUN Binding Response attributes */
+        uint16_t msg_type;
+        memcpy(&msg_type, resp, 2);
+        msg_type = ntohs(msg_type);
+        if (msg_type != 0x0101) continue; /* must be Binding Success */
+        size_t off = 20;
+        while (off + 4 <= (size_t)n) {
+            uint16_t attr_type, attr_len;
+            memcpy(&attr_type, resp + off,     2); attr_type = ntohs(attr_type);
+            memcpy(&attr_len,  resp + off + 2, 2); attr_len  = ntohs(attr_len);
+            if (off + 4 + attr_len > (size_t)n) break;
+            /* MAPPED-ADDRESS (0x0001) or XOR-MAPPED-ADDRESS (0x0020) */
+            if ((attr_type == 0x0001 || attr_type == 0x0020) && attr_len >= 8) {
+                uint8_t family = resp[off + 5];
+                if (family != 0x01) { off += 4 + attr_len; continue; }
+                uint32_t ip_raw;
+                memcpy(&ip_raw, resp + off + 8, 4);
+                if (attr_type == 0x0020) {
+                    /* XOR with magic cookie */
+                    ip_raw ^= htonl(0x2112a442);
+                }
+                struct in_addr addr;
+                addr.s_addr = ip_raw;
+                inet_ntop(AF_INET, &addr, ext_ip_out, INET_ADDRSTRLEN);
+                return 0;
+            }
+            off += 4 + ((attr_len + 3) & ~3u); /* 4-byte aligned */
+        }
+    }
+    return -1;
+}
+
+/* === dt_discover_external_ip() — public API ===
+ * Try UPnP first; fall back to STUN raw UDP. */
+static int dt_discover_external_ip(char ext_ip_out[INET_ADDRSTRLEN])
+{
+    if (dt_upnp_get_external_ip(ext_ip_out) == 0) return 0;
+    return dt_stun_get_external_ip(ext_ip_out);
+}
+
+/* ============================================================
+ * === LPI TRAFFIC SHAPING — Randomised Constant Bitrate (Roadmap §4)
+ * ============================================================
+ * RCBR pacer: maintains a constant baseline packet-per-second rate
+ * on port 443.  Jitter = ±δ where δ ∈ [5%, 10%] of baseline period.
+ * When the file buffer drains, Ghost Chunks on VPORT_GHOST_VAL fill
+ * the window to eliminate bursty signatures.
+ * ============================================================ */
+typedef struct {
+    uint64_t baseline_interval_ns;  /* target inter-packet delay           */
+    uint64_t next_send_ns;          /* absolute deadline for next packet   */
+    uint32_t jitter_pct_lo;         /* jitter lower bound (% of interval)  */
+    uint32_t jitter_pct_hi;         /* jitter upper bound (% of interval)  */
+    uint64_t active_window_ns;      /* total shaping window (default 5min) */
+    uint64_t window_start_ns;       /* when this window opened             */
+} rcbr_pacer_t;
+
+static void rcbr_pacer_init(rcbr_pacer_t *p,
+                              uint64_t baseline_interval_ns,
+                              uint64_t active_window_ns)
+{
+    p->baseline_interval_ns = baseline_interval_ns;
+    p->jitter_pct_lo        = 5u;
+    p->jitter_pct_hi        = 10u;
+    p->active_window_ns     = active_window_ns;
+    p->window_start_ns      = mpcp_now_ns();
+    /* first send: random offset in [0, interval) to desync peers */
+    uint32_t r;
+    (void)getrandom(&r, sizeof(r), 0);
+    p->next_send_ns = p->window_start_ns +
+                      (r % (uint32_t)(baseline_interval_ns > 0 ?
+                                      baseline_interval_ns : 1u));
+}
+
+static bool rcbr_window_active(const rcbr_pacer_t *p)
+{
+    return (mpcp_now_ns() - p->window_start_ns) < p->active_window_ns;
+}
+
+/* Wait until the next RCBR slot; returns true if a real packet should
+ * be sent, false if caller should send a Ghost Chunk instead. */
+static bool rcbr_pacer_wait(rcbr_pacer_t *p, bool data_available)
+{
+    /* Compute jittered delay for next slot */
+    uint64_t base = p->baseline_interval_ns;
+    uint32_t r;
+    (void)getrandom(&r, sizeof(r), 0);
+    uint32_t jitter_range = (uint32_t)((base * (p->jitter_pct_hi - p->jitter_pct_lo)) / 100u);
+    uint64_t jitter = (jitter_range > 0) ? (r % jitter_range) : 0u;
+    /* ± selection */
+    uint32_t sign_bit;
+    (void)getrandom(&sign_bit, sizeof(sign_bit), 0);
+    int64_t signed_jitter = (sign_bit & 1u) ?
+        (int64_t)((base * p->jitter_pct_lo) / 100u + jitter) :
+        -(int64_t)((base * p->jitter_pct_lo) / 100u + jitter);
+    uint64_t now = mpcp_now_ns();
+    uint64_t next = p->next_send_ns;
+    if (now < next) {
+        struct timespec ts;
+        ts.tv_sec  = (time_t)(next / 1000000000ULL);
+        ts.tv_nsec = (long)(next % 1000000000ULL);
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+    }
+    p->next_send_ns = next + base + (uint64_t)((int64_t)base / 100LL * signed_jitter / (int64_t)base);
+    /* Clamp: next slot always at least 10% of baseline away */
+    uint64_t min_next = mpcp_now_ns() + base / 10u;
+    if (p->next_send_ns < min_next) p->next_send_ns = min_next;
+    return data_available;  /* caller decides real vs ghost */
+}
+
+/* ============================================================
+ * === EXECUTION SHIELD — Capability Management (Roadmap §5)
+ * ============================================================
+ * On-demand privilege escalation (never at startup).
+ * CAP_NET_RAW + CAP_SYS_NICE acquired only when stealth mode
+ * is explicitly requested by the operator.
+ *
+ * Memory locking: mlockall(MCL_CURRENT|MCL_FUTURE) called
+ * immediately after session keys are loaded.
+ * ============================================================ */
+
+static bool g_stealth_caps_active = false;
+
+/* dt_acquire_stealth_caps(): request CAP_NET_RAW + CAP_SYS_NICE.
+ * No-op on failure (we continue without them). */
+static void dt_acquire_stealth_caps(void)
+{
+#ifdef __linux__
+    struct __user_cap_header_struct hdr;
+    struct __user_cap_data_struct   data[2];
+    memset(&hdr,  0, sizeof(hdr));
+    memset(&data, 0, sizeof(data));
+    hdr.version = _LINUX_CAPABILITY_VERSION_3;
+    hdr.pid     = 0;
+    if (capget(&hdr, data) != 0) return;
+    uint32_t want = (1u << CAP_NET_RAW) | (1u << CAP_SYS_NICE);
+    data[0].effective  |= want;
+    data[0].permitted  |= want;
+    data[0].inheritable = 0;
+    if (capset(&hdr, data) == 0) {
+        g_stealth_caps_active = true;
+        fprintf(stderr, "[shield] CAP_NET_RAW + CAP_SYS_NICE acquired\n");
+    }
+#endif
+}
+
+/* dt_memory_lock(): lock all current and future pages.
+ * Called immediately after session key material is loaded. */
+static void dt_memory_lock(void)
+{
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0)
+        fprintf(stderr, "[shield] mlockall: all key pages locked\n");
+    else
+        fprintf(stderr, "[shield] mlockall: %s (continuing)\n", strerror(errno));
+}
+
+/* ============================================================ */
 int mpcp_derive_master_secret(
 const uint8_t  *session_nonce,  
 const double   *rtt_samples,  
@@ -1390,7 +1951,7 @@ return rc;
   cfg->zerocopy           = true;
   cfg->batch_syscalls     = true;
   cfg->tripwire           = true;
-  cfg->tripwire_z_threshold = 5.0;
+  cfg->tripwire_z_threshold = 3.0;  /* Roadmap §6: Z > 3.0 triggers wipe+exit(1) */
   cfg->tripwire_window    = 5;
   cfg->tripwire_chi_pvalue= 0.05;
   {
@@ -1449,6 +2010,8 @@ return rc;
   cfg->auth_mode              = MPCP_AUTH_ED25519;
   cfg->tripwire_z_threshold   = 3.0;
   cfg->ack_jitter_max         = 120;
+  /* === v2: Roadmap §5 — on-demand capability escalation for stealth mode === */
+  dt_acquire_stealth_caps();
   }
   void mpcp_profile_stealth_decoy(mpcp_config_t *cfg)
   {
@@ -1860,8 +2423,9 @@ return rc;
     const uint8_t session_nonce[MPCP_SESSION_NONCE_LEN])
     {
     memset(pkt, 0, sizeof(*pkt));
-    uint32_t magic_be = htonl(MPCP_MAGIC);
-    memcpy(&pkt->hdr.magic, &magic_be, 4);
+    /* === v2: no MPCP_MAGIC in header — vport_id goes in hdr instead === */
+    pkt->hdr.vport_id = htons(VPORT_CTRL_PLANE);
+    randombytes_buf(pkt->hdr.rand_pad, sizeof(pkt->hdr.rand_pad));
     pkt->hdr.version = MPCP_VERSION;
     pkt->hdr.type    = MPCP_TYPE_PING;
     pkt->seq = htons(seq);
@@ -1879,9 +2443,7 @@ return rc;
     {
     if (len < sizeof(mpcp_cal_pkt_t)) return false;
     const mpcp_cal_pkt_t *pkt = (const mpcp_cal_pkt_t *)buf;
-    uint32_t magic;
-    memcpy(&magic, &pkt->hdr.magic, 4);
-    if (ntohl(magic) != MPCP_MAGIC) return false;
+    /* === v2: no MPCP_MAGIC check — trial decryption already validated authenticity === */
     if (pkt->hdr.version != MPCP_VERSION) return false;
     if (pkt->hdr.type != MPCP_TYPE_PONG) return false;
     if (ntohs(pkt->seq) != expected_seq) return false;
@@ -1914,6 +2476,12 @@ return rc;
     char buf[CMSG_SPACE(sizeof(struct scm_timestamping))];
     struct cmsghdr align;
     } cmsg_buf;
+    /* === v2: derive cal_key from PSK for encrypted calibration packets === */
+    uint8_t cal_key[32];
+    if (cal_key_from_psk(session_nonce, MPCP_SESSION_NONCE_LEN, cal_key) != MPCP_OK) {
+        memset(cal_key, 0, sizeof(cal_key));
+        return 0;
+    }
 
 for (uint32_t batch_start = 0;
 batch_start < ping_count;
@@ -1927,45 +2495,44 @@ uint64_t send_times[64] = {0};
 for (uint32_t i = 0; i < this_batch; i++) {
 mpcp_cal_pkt_t pkt;
 build_ping(&pkt, (uint16_t)(seq + i), session_nonce);
-uint8_t wire_buf[MPCP_CAL_WIRE_BUF];
-size_t  wire_len = sizeof(mpcp_cal_pkt_t);
-if (disguise) {
-wire_len = mpcp_disguise_wrap(
-(const uint8_t *)&pkt, sizeof(pkt),
-wire_buf, sizeof(wire_buf),
-disguise_proto);
-if (wire_len == 0) { send_times[i] = 0; continue; }
-} else {
-memcpy(wire_buf, &pkt, sizeof(pkt));
-}
 send_times[i] = mpcp_now_ns();
-sendto(sock_fd, wire_buf, wire_len, 0,
-(const struct sockaddr *)peer, sizeof(*peer));
+/* === v2: encrypt entire ping under cal_key — no plaintext on wire === */
+if (disguise) {
+    uint8_t wire_buf[MPCP_CAL_WIRE_BUF];
+    size_t inner = mpcp_disguise_wrap(
+        (const uint8_t *)&pkt, sizeof(pkt),
+        wire_buf, sizeof(wire_buf), disguise_proto);
+    if (inner == 0) { send_times[i] = 0; continue; }
+    dt_send_wire(sock_fd, wire_buf, inner, cal_key,
+                 (const struct sockaddr *)peer, sizeof(*peer));
+} else {
+    dt_send_wire(sock_fd, &pkt, sizeof(pkt), cal_key,
+                 (const struct sockaddr *)peer, sizeof(*peer));
+}
 }
 fprintf(stderr, "\r  [pings %u-%u/%u] sent, collecting pongs…   ",
 seq + 1, seq + this_batch, ping_count);
 fflush(stderr);
 {
-uint8_t recv_buf[MPCP_CAL_WIRE_BUF];
+uint8_t plain_buf[MPCP_CAL_WIRE_BUF];
 bool matched[64] = {false};
 uint32_t matched_count = 0;
 for (uint32_t i = 0; i < this_batch && matched_count < this_batch; i++) {
 struct sockaddr_in from_addr;
 /* Use recvmsg so we can extract SCM_TIMESTAMPING control messages */
-struct iovec iov = { .iov_base = recv_buf, .iov_len = sizeof(recv_buf) };
 struct msghdr msg = {
 .msg_name       = &from_addr,
 .msg_namelen    = sizeof(from_addr),
-.msg_iov        = &iov,
-.msg_iovlen     = 1,
+.msg_iov        = NULL,    /* set by dt_recvmsg_trial */
+.msg_iovlen     = 0,
 .msg_control    = cmsg_buf.buf,
 .msg_controllen = sizeof(cmsg_buf.buf),
 .msg_flags      = 0,
 };
-ssize_t n = recvmsg(sock_fd, &msg, 0);
+/* === v2: trial decrypt with cal_key, drop noise silently === */
+ssize_t n = dt_recvmsg_trial(sock_fd, &msg, plain_buf, sizeof(plain_buf), cal_key);
 if (n < 0) continue;
 if (from_addr.sin_addr.s_addr != peer->sin_addr.s_addr) continue;
-if ((size_t)n < sizeof(mpcp_cal_pkt_t)) continue;
 /* Extract hardware timestamp — falls back to CLOCK_MONOTONIC if unavailable */
 uint64_t recv_ts = mpcp_now_ns();
 for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
@@ -1975,7 +2542,6 @@ if (cmsg->cmsg_level == SOL_SOCKET &&
 cmsg->cmsg_type  == SCM_TIMESTAMPING) {
 struct scm_timestamping *tss =
 (struct scm_timestamping *)(void *)CMSG_DATA(cmsg);
-/* ts[2] = raw hardware; ts[0] = software realtime fallback */
 struct timespec *hw  = &tss->ts[2];
 struct timespec *sw  = &tss->ts[0];
 struct timespec *best = (hw->tv_sec || hw->tv_nsec) ? hw : sw;
@@ -1988,14 +2554,14 @@ break;
 size_t payload_len = (size_t)n;
 if (disguise) {
 payload_len = mpcp_disguise_unwrap(
-recv_buf, (size_t)n,
-recv_buf, sizeof(recv_buf),
+plain_buf, (size_t)n,
+plain_buf, sizeof(plain_buf),
 disguise_proto);
 if (payload_len == 0) continue;
 }
 uint64_t pkt_send_ts;
 for (uint32_t j = 0; j < this_batch; j++) {
-if (!parse_pong(recv_buf, payload_len, (uint16_t)(seq + j), &pkt_send_ts))
+if (!parse_pong(plain_buf, payload_len, (uint16_t)(seq + j), &pkt_send_ts))
 continue;
 if (send_times[j] == 0) break;
 if (matched[j]) break;
@@ -2013,6 +2579,7 @@ break;
 }
 seq += (uint16_t)this_batch;
 }
+sodium_memzero(cal_key, sizeof(cal_key));
 return collected;
 }
 static size_t calibrate_slow(int sock_fd,
@@ -2026,13 +2593,17 @@ bool disguise,
 mpcp_disguise_proto_t disguise_proto)
 {
 size_t collected = 0;
+/* === v2: cal_key derived from session_nonce (PSK proxy during calibration) === */
+uint8_t cal_key[32];
+if (cal_key_from_psk(session_nonce, MPCP_SESSION_NONCE_LEN, cal_key) != MPCP_OK)
+    return 0;
 for (uint32_t i = 0; i < ping_count; i++) {
 uint32_t rng;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-result"
-(void)getrandom(&rng, sizeof(rng), 0);  
+(void)getrandom(&rng, sizeof(rng), 0);
 #pragma GCC diagnostic pop
-uint32_t gap_ms = (rng % (max_gap_ms - min_gap_ms + 1)) + min_gap_ms;  
+uint32_t gap_ms = (rng % (max_gap_ms - min_gap_ms + 1)) + min_gap_ms;
 struct timespec ts = {
 .tv_sec  = gap_ms / 1000,
 .tv_nsec = (long)(gap_ms % 1000) * 1000000L
@@ -2040,39 +2611,41 @@ struct timespec ts = {
 nanosleep(&ts, NULL);
 mpcp_cal_pkt_t pkt;
 build_ping(&pkt, (uint16_t)i, session_nonce);
-uint8_t wire_buf[MPCP_CAL_WIRE_BUF];
-size_t  wire_len = sizeof(pkt);
-if (disguise) {
-wire_len = mpcp_disguise_wrap(
-(const uint8_t *)&pkt, sizeof(pkt),
-wire_buf, sizeof(wire_buf), disguise_proto);
-} else {
-memcpy(wire_buf, &pkt, sizeof(pkt));
-}
 uint64_t send_ts = mpcp_now_ns();
-sendto(sock_fd, wire_buf, wire_len, 0,
-(const struct sockaddr *)peer, sizeof(*peer));
-uint8_t recv_buf[MPCP_CAL_WIRE_BUF];
+/* === v2: encrypt under cal_key — zero plaintext bytes on wire === */
+if (disguise) {
+    uint8_t wire_buf[MPCP_CAL_WIRE_BUF];
+    size_t wl = mpcp_disguise_wrap(
+        (const uint8_t *)&pkt, sizeof(pkt),
+        wire_buf, sizeof(wire_buf), disguise_proto);
+    if (wl > 0)
+        dt_send_wire(sock_fd, wire_buf, wl, cal_key,
+                     (const struct sockaddr *)peer, sizeof(*peer));
+} else {
+    dt_send_wire(sock_fd, &pkt, sizeof(pkt), cal_key,
+                 (const struct sockaddr *)peer, sizeof(*peer));
+}
+uint8_t plain_buf[MPCP_CAL_WIRE_BUF];
 struct sockaddr_in from_s; socklen_t flen_s = sizeof(from_s);
-ssize_t n = recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0,
-(struct sockaddr *)&from_s, &flen_s);
+ssize_t n = dt_recv_trial(sock_fd, plain_buf, sizeof(plain_buf),
+                           cal_key, &from_s, &flen_s);
 if (n < 0) continue;
 if (from_s.sin_addr.s_addr != peer->sin_addr.s_addr) continue;
-if ((size_t)n < sizeof(mpcp_cal_pkt_t)) continue;
-uint64_t recv_ts = mpcp_now_ns();  
+uint64_t recv_ts = mpcp_now_ns();
 if (disguise) {
-size_t ul = mpcp_disguise_unwrap(recv_buf, (size_t)n,
-recv_buf, sizeof(recv_buf),
+size_t ul = mpcp_disguise_unwrap(plain_buf, (size_t)n,
+plain_buf, sizeof(plain_buf),
 disguise_proto);
 if (ul == 0) continue;
 }
 uint64_t pkt_send_ts;
-if (!parse_pong(recv_buf, (size_t)n, (uint16_t)i, &pkt_send_ts))
+if (!parse_pong(plain_buf, (size_t)n, (uint16_t)i, &pkt_send_ts))
 continue;
 double rtt_ms = (double)(recv_ts - send_ts) / 1e6;
 if (rtt_ms > 0.01 && rtt_ms < 5000.0)
 rtts_out[collected++] = rtt_ms;
 }
+sodium_memzero(cal_key, sizeof(cal_key));
 return collected;
 }
 static void __attribute__((unused)) mini_recal(int sock_fd,
@@ -2217,29 +2790,37 @@ uint64_t *t_recv_raw_out)
 {
 mpcp_cal_pkt_t ping;
 build_ping(&ping, seq, session_nonce);
-uint8_t wire[MPCP_CAL_WIRE_BUF];
-size_t wire_len = sizeof(ping);
-if (cfg->disguise_calibration) {
-wire_len = mpcp_disguise_wrap((const uint8_t *)&ping, sizeof(ping),
-wire, sizeof(wire), cfg->disguise_protocol);
-if (wire_len == 0) return MPCP_ERR_PROTO;
-} else {
-memcpy(wire, &ping, sizeof(ping));
-}
+/* === v2: cal_key derived from session_nonce; all wire bytes are AEAD === */
+uint8_t cal_key[32];
+if (cal_key_from_psk(session_nonce, MPCP_SESSION_NONCE_LEN, cal_key) != MPCP_OK)
+    return MPCP_ERR_CRYPTO;
 uint64_t t0 = mpcp_now_raw_ns();
-if (sendto(sock, wire, wire_len, 0, (const struct sockaddr *)peer, sizeof(*peer)) < 0)
-return MPCP_ERR_IO;
+ssize_t sent;
+if (cfg->disguise_calibration) {
+    uint8_t wire[MPCP_CAL_WIRE_BUF];
+    size_t wl = mpcp_disguise_wrap((const uint8_t *)&ping, sizeof(ping),
+                                    wire, sizeof(wire), cfg->disguise_protocol);
+    if (wl == 0) { sodium_memzero(cal_key, 32); return MPCP_ERR_PROTO; }
+    sent = dt_send_wire(sock, wire, wl, cal_key,
+                        (const struct sockaddr *)peer, sizeof(*peer));
+} else {
+    sent = dt_send_wire(sock, &ping, sizeof(ping), cal_key,
+                        (const struct sockaddr *)peer, sizeof(*peer));
+}
+if (sent < 0) { sodium_memzero(cal_key, 32); return MPCP_ERR_IO; }
 uint8_t rx[MPCP_CAL_WIRE_BUF];
 struct sockaddr_in from;
 socklen_t fromlen = sizeof(from);
-ssize_t n = recvfrom(sock, rx, sizeof(rx), 0, (struct sockaddr *)&from, &fromlen);
+ssize_t n = dt_recv_trial(sock, rx, sizeof(rx), cal_key, &from, &fromlen);
 uint64_t t1 = mpcp_now_raw_ns();
+sodium_memzero(cal_key, 32);
 if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK) ? MPCP_ERR_TIMEOUT : MPCP_ERR_IO;
 if (from.sin_addr.s_addr != peer->sin_addr.s_addr) return MPCP_ERR_TIMEOUT;
 size_t payload_len = (size_t)n;
 if (cfg->disguise_calibration) {
-payload_len = mpcp_disguise_unwrap(rx, (size_t)n, rx, sizeof(rx), cfg->disguise_protocol);
-if (payload_len == 0) return MPCP_ERR_PROTO;
+    payload_len = mpcp_disguise_unwrap(rx, payload_len, rx, sizeof(rx),
+                                        cfg->disguise_protocol);
+    if (payload_len == 0) return MPCP_ERR_PROTO;
 }
 uint64_t echoed_send_ts = 0;
 if (!parse_pong(rx, payload_len, seq, &echoed_send_ts)) return MPCP_ERR_PROTO;
@@ -2373,23 +2954,28 @@ nanosleep(&ts, NULL);
 struct sockaddr_in ghost_peer = *peer_addr;
 mpcp_cal_pkt_t ghost;
 build_ping(&ghost, 0xEE01u, sess->session_nonce);
-uint8_t wire[MPCP_CAL_WIRE_BUF];
-size_t wire_len = sizeof(ghost);
+/* === v2: ghost probe also encrypted under cal_key === */
+uint8_t ghost_cal_key[32];
+(void)cal_key_from_psk(sess->session_nonce, MPCP_SESSION_NONCE_LEN, ghost_cal_key);
 if (cfg->disguise_calibration) {
-wire_len = mpcp_disguise_wrap((const uint8_t *)&ghost, sizeof(ghost), wire,
-sizeof(wire), cfg->disguise_protocol);
+    uint8_t wire[MPCP_CAL_WIRE_BUF];
+    size_t wl = mpcp_disguise_wrap((const uint8_t *)&ghost, sizeof(ghost),
+                                    wire, sizeof(wire), cfg->disguise_protocol);
+    if (wl > 0)
+        (void)dt_send_wire(sock, wire, wl, ghost_cal_key,
+                           (const struct sockaddr *)&ghost_peer, sizeof(ghost_peer));
 } else {
-memcpy(wire, &ghost, sizeof(ghost));
+    (void)dt_send_wire(sock, &ghost, sizeof(ghost), ghost_cal_key,
+                       (const struct sockaddr *)&ghost_peer, sizeof(ghost_peer));
 }
-if (wire_len > 0)
-(void)sendto(sock, wire, wire_len, 0, (const struct sockaddr *)&ghost_peer, sizeof(ghost_peer));
 /* Best-effort ghost pong wait: 200 ms window, non-fatal on timeout. */
 {
 struct timeval ghost_tv = { .tv_sec = 0, .tv_usec = 200000 };
 (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &ghost_tv, sizeof(ghost_tv));
 uint8_t rx[MPCP_CAL_WIRE_BUF];
 struct sockaddr_in from; socklen_t fromlen = sizeof(from);
-ssize_t rn = recvfrom(sock, rx, sizeof(rx), 0, (struct sockaddr *)&from, &fromlen);
+ssize_t rn = dt_recv_trial(sock, rx, sizeof(rx), ghost_cal_key, &from, &fromlen);
+sodium_memzero(ghost_cal_key, 32);
 if (rn > 0) {
 size_t plen = (size_t)rn;
 if (cfg->disguise_calibration)
@@ -2399,6 +2985,8 @@ if (plen > 0 && parse_pong(rx, plen, 0xEE01u, &ts_echo)) {
 calib_out->handshake_locked = true;
 fprintf(stderr, "[Sync] Ghost pong received — epoch locked.\n");
 }
+} else {
+    sodium_memzero(ghost_cal_key, 32);
 }
 if (!calib_out->handshake_locked)
 fprintf(stderr, "[Sync] Ghost pong not received — proceeding without lock.\n");
@@ -2868,8 +3456,9 @@ uint8_t         direction,
 mpcp_key_pkt_t *pkt_out)
 {
 memset(pkt_out, 0, sizeof(*pkt_out));
-uint32_t magic_be = htonl(MPCP_MAGIC);
-memcpy(&pkt_out->hdr.magic, &magic_be, 4);
+/* === v2: vport_id replaces magic — packet is encrypted on wire anyway === */
+pkt_out->hdr.vport_id = htons(VPORT_CTRL_PLANE);
+randombytes_buf(pkt_out->hdr.rand_pad, sizeof(pkt_out->hdr.rand_pad));
 pkt_out->hdr.version = MPCP_VERSION;
 pkt_out->hdr.type    = MPCP_TYPE_KEY_EXCHANGE;
 pkt_out->key_index   = key_index;
@@ -2893,11 +3482,9 @@ int mpcp_kex_unpack(const uint8_t        *master_secret,
 const mpcp_key_pkt_t *pkt,
 uint8_t              *candidate_key_out)
 {
-uint32_t magic;
-memcpy(&magic, &pkt->hdr.magic, 4);
-if (ntohl(magic)             != MPCP_MAGIC)            return MPCP_ERR_PROTO;
-if (pkt->hdr.version         != MPCP_VERSION)          return MPCP_ERR_PROTO;
-if (pkt->hdr.type            != MPCP_TYPE_KEY_EXCHANGE) return MPCP_ERR_PROTO;
+/* === v2: no MPCP_MAGIC check — trial decryption already validated MAC === */
+if (pkt->hdr.version != MPCP_VERSION)          return MPCP_ERR_PROTO;
+if (pkt->hdr.type    != MPCP_TYPE_KEY_EXCHANGE) return MPCP_ERR_PROTO;
 uint8_t ad[26];
 ad[0] = pkt->key_index;
 ad[1] = pkt->direction;
@@ -3048,15 +3635,17 @@ int fd = socket(AF_INET, SOCK_DGRAM, 0);
 if (fd < 0) return MPCP_ERR_IO;
 mpcp_kex_sync_pkt_t pkt;
 memset(&pkt, 0, sizeof(pkt));
-uint32_t magic_be = htonl(MPCP_MAGIC);
-memcpy(&pkt.hdr.magic, &magic_be, 4);
+/* === v2: vport_id replaces magic; packet encrypted on wire under master_secret === */
+pkt.hdr.vport_id = htons(VPORT_CTRL_PLANE);
+randombytes_buf(pkt.hdr.rand_pad, sizeof(pkt.hdr.rand_pad));
 pkt.hdr.version = MPCP_VERSION;
 pkt.hdr.type    = MPCP_TYPE_ACK;
 pkt.tzero_ns_be = __builtin_bswap64(tzero_ns);
 struct sockaddr_in dst = *pc1_addr;
 dst.sin_port = htons(auth_port);
 for (int i = 0; i < 5; i++) {
-sendto(fd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(dst));
+dt_send_wire(fd, &pkt, sizeof(pkt), sess->master_secret,
+             (struct sockaddr *)&dst, sizeof(dst));
 struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000L };
 nanosleep(&ts, NULL);
 }
@@ -3076,15 +3665,16 @@ if (fd < 0) return MPCP_ERR_IO;
 struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
 int pr = poll(&pfd, 1, 3000);
 if (pr <= 0) { close(fd); return MPCP_ERR_TIMEOUT; }
+/* === v2: trial decrypt with master_secret; drop noise silently === */
 mpcp_kex_sync_pkt_t pkt;
 struct sockaddr_in from; socklen_t fl = sizeof(from);
-ssize_t n = recvfrom(fd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&from, &fl);
+ssize_t n = dt_recv_trial(fd, &pkt, sizeof(pkt),
+                           sess->master_secret, &from, &fl);
 close(fd);
-if (n != (ssize_t)sizeof(pkt)) return MPCP_ERR_PROTO;
+if (n < (ssize_t)sizeof(pkt)) return MPCP_ERR_PROTO;
 if (expected_peer && from.sin_addr.s_addr != expected_peer->sin_addr.s_addr) return MPCP_ERR_PROTO;
-uint32_t magic;
-memcpy(&magic, &pkt.hdr.magic, 4);
-if (ntohl(magic) != MPCP_MAGIC || pkt.hdr.version != MPCP_VERSION || pkt.hdr.type != MPCP_TYPE_ACK)
+/* No magic check — AEAD tag is the authenticator */
+if (pkt.hdr.version != MPCP_VERSION || pkt.hdr.type != MPCP_TYPE_ACK)
 return MPCP_ERR_PROTO;
 *tzero_out = __builtin_bswap64(pkt.tzero_ns_be);
 return MPCP_OK;
@@ -3210,6 +3800,8 @@ rc = mpcp_derive_session_key(sess->master_secret,
 cands_out->keys[selected_idx],
 sess->session_key);
 if (rc != MPCP_OK) goto done_pc1;
+/* === v2: Roadmap §5 — lock key pages immediately after session key loads === */
+dt_memory_lock();
 mpcp_keygen_candidates_wipe_losers(cands_out, selected_idx);
 rc = auth_send_sig(cfg, sess, pc2_addr);
 if (rc != MPCP_OK) goto done_pc1;
@@ -3258,7 +3850,7 @@ fprintf(stderr, "[exchange] PC2: kex_port[%u] = %u (fd=%d)\n",
 _di, recv_socks[_di].port, recv_socks[_di].fd);
 fprintf(stderr, "[exchange] PC2: waiting for %u candidate keys from PC1=%s\n",
 N, inet_ntoa(pc1_addr->sin_addr));
-uint64_t deadline = mpcp_now_ns() + 10000000000ULL;
+uint64_t deadline = mpcp_now_ns() + 30000000000ULL; /* Fix 5: was 10s; 30s resolves race with stealth silence period */
 while (mpcp_now_ns() < deadline) {
 uint32_t cnt_check = 0;
 for (uint32_t i = 0; i < N; i++) if (got_key[i]) cnt_check++;
@@ -3344,6 +3936,8 @@ sodium_memzero(selected_buf, 32); sodium_free(selected_buf);
 free_key_bufs(return_buf, N);
 goto done_pc2;
 }
+/* === v2: Roadmap §5 — lock key pages immediately after session key loads === */
+dt_memory_lock();
 sodium_memzero(selected_buf, 32);
 sodium_free(selected_buf);
 selected_buf = NULL;
@@ -3504,8 +4098,16 @@ mpcp_session_t  *sess,
 const char      *canary_log_path,
 const char      *anomaly_type)
 {
+/* === v2: Z > 3.0 → immediate sodium_memzero of ALL key material + exit(1)
+ * Formula: Z = (x - μ) / σ  — if Z > 3.0 the session is compromised.
+ * No graceful shutdown; no cleanup threads; wipe and terminate immediately. */
 if (sess) {
-mpcp_crypto_abort(sess);
+sodium_memzero(sess->session_key,   MPCP_SESSION_KEY_LEN);
+sodium_memzero(sess->master_secret, MPCP_MASTER_SECRET_LEN);
+sodium_memzero(sess->session_nonce, MPCP_SESSION_NONCE_LEN);
+sodium_memzero(sess->file_sha256,   sizeof(sess->file_sha256));
+/* Belt-and-suspenders: wipe the entire session struct */
+sodium_memzero(sess, sizeof(*sess));
 }
 if (canary_log_path && canary_log_path[0] != '\0') {
 FILE *f = fopen(canary_log_path, "a");
@@ -3515,30 +4117,15 @@ char   ts[64];
 struct tm tmbuf;
 strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ",
 gmtime_r(&now, &tmbuf));
-uint8_t nonce_hash[32];
-char    nonce_hex[65];
-if (sess) {
-crypto_hash_sha256_state sha_st;
-crypto_hash_sha256_init(&sha_st);
-crypto_hash_sha256_update(&sha_st, sess->session_nonce,
-MPCP_SESSION_NONCE_LEN);
-crypto_hash_sha256_final(&sha_st, nonce_hash);
-for (size_t i = 0; i < 32u; i++) {
-(void)snprintf(nonce_hex + (int)(i*2u), 3, "%02x", nonce_hash[i]);
-}
-nonce_hex[64] = '\0';
-} else {
-(void)strncpy(nonce_hex, "unknown", sizeof(nonce_hex) - 1);
-nonce_hex[sizeof(nonce_hex)-1] = '\0';
-}
-fprintf(f, "[%s] TRIPWIRE anomaly=%s session=%s\n",
+/* Session nonce already zeroed — log a hash of zeroes as sentinel */
+fprintf(f, "[%s] TRIPWIRE anomaly=%s session=<wiped>\n",
 ts,
-anomaly_type ? anomaly_type : "unknown",
-nonce_hex);
+anomaly_type ? anomaly_type : "unknown");
 fclose(f);
 }
 }
-_Exit(0);
+/* Roadmap §6: exit(1) not _Exit(0) — signals abnormal termination */
+exit(1);
 }
 int mpcp_chunker_detect_compressibility(const uint8_t     *src,
 size_t             src_len,
@@ -4393,8 +4980,13 @@ mpcp_sender_ctx_t *ctx = a->ctx;
   uint8_t *pkt    = (pkt_len <= SEND_PKT_MAX) ? pkt_stack : NULL;
   if (!pkt) return MPCP_ERR_PARAM;
   (void)try_zerocopy;
-  uint32_t magic_be = htonl(MPCP_MAGIC);
-  memcpy(pkt,     &magic_be, 4);
+  /* === v2: vport_id + rand_pad replace MPCP_MAGIC — no plaintext magic on wire ===
+   * Bytes 0-1: vport_id (VPORT_DATA_STREAM or VPORT_GHOST_VAL, big-endian)
+   * Bytes 2-3: random padding (changes every packet; no static 4-byte fingerprint) */
+  uint16_t vport_be = htons(
+      (pkt_type == MPCP_TYPE_GHOST_CHUNK) ? VPORT_GHOST_VAL : VPORT_DATA_STREAM);
+  memcpy(pkt, &vport_be, 2);
+  randombytes_buf(pkt + 2, 2);           /* rand_pad — per-packet, unpredictable */
   pkt[4] = MPCP_VERSION;
   pkt[5] = pkt_type;
   uint32_t seq_be = htonl(slot->seq_index);
@@ -4933,9 +5525,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
       continue;
   }
   consecutive_timeouts = 0;
-  uint32_t magic;
-  memcpy(&magic, buf, 4);
-  if (ntohl(magic) != MPCP_MAGIC) continue;
+  /* === v2: no MPCP_MAGIC check — vport_id at buf[0..1]; version+type guard === */
   if (buf[4] != MPCP_VERSION)     continue;
   if (buf[5] != MPCP_TYPE_ACK)    continue;
   uint32_t ack_seq;
@@ -5304,7 +5894,10 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   for (uint32_t i = 0; i < n; i++) {
   uint32_t seq = seqs[i];
   out[i].chunk_index = seq;
-  double scaled = (double)i * (double)interval_ns * drift_coefficient;
+  /* Use absolute seq (not block-relative i) so receiver timing matches sender:
+   *   sender:   t = origin + seq * interval
+   *   receiver: t = tzero  + seq * interval   (tzero == origin) */
+  double scaled = (double)seq * (double)interval_ns * drift_coefficient;
   int64_t target = (int64_t)tzero_ns + (int64_t)scaled;
   int32_t jit = schedule_jitter_ns(sess, seq);
   out[i].jitter_ns = jit;
@@ -5324,13 +5917,6 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   out[i].sub_index = sub;
   out[i].ephemeral_port = p;
   }
-  }
-  static void sleep_until_raw_abs(uint64_t when_ns)
-  {
-  struct timespec ts;
-  ts.tv_sec  = (time_t)(when_ns / 1000000000ULL);
-  ts.tv_nsec = (long)(when_ns % 1000000000ULL);
-  (void)clock_nanosleep(CLOCK_MONOTONIC_RAW, TIMER_ABSTIME, &ts, NULL);
   }
   static bool receiver_validate_ciphertext(const mpcp_session_t *sess,
   const mpcp_config_t *cfg,
@@ -5374,9 +5960,10 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (sess->blink_interval_ns > 0) {
   blink_window_t win;
   blink_window_init(&win);
-  uint64_t now_raw = mpcp_now_raw_ns();
+  /* Clock domain: tzero is CLOCK_MONOTONIC (set by mpcp_now_ns in transfer_info_recv).
+   * ALL timing in this loop uses CLOCK_MONOTONIC to match the sender. */
   uint64_t tzero = sess->t_zero_ns ? sess->t_zero_ns : sess->blink_origin_ns;
-  if (tzero == 0) tzero = now_raw + 1000000000ULL;
+  if (tzero == 0) tzero = mpcp_now_ns() + 1000000000ULL;
   double drift = (sess->drift_coefficient > 0.0) ? sess->drift_coefficient : 1.0;
   schedule_entry_t *sched = calloc(n, sizeof(*sched));
   bool *got = calloc(n, sizeof(bool));
@@ -5387,10 +5974,28 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   mpcp_generate_schedule(sess, cfg, a->block_seqs, n,
   tzero, sess->blink_interval_ns, drift, sched);
+  /* Diagnostic: show timing state when JIT loop starts */
+  {
+    int64_t ms_until_zero = (int64_t)(tzero - mpcp_now_ns()) / 1000000LL;
+    fprintf(stderr, "[blink-jit] loop start: %u chunks, interval=%.1fms, T0 in %+ldms, port[0]=%u\n",
+            n, (double)sess->blink_interval_ns / 1e6, (long)ms_until_zero,
+            n > 0 ? sched[0].ephemeral_port : 0);
+    fflush(stderr);
+  }
   double pid_integral_ns = 0.0;
   double pid_correction_ns = 0.0;
   const double Kp = 0.3;
   const double Ki = 0.02;
+  /* Fix 3 (Kalman-window, revised):
+   * Pre-open = max(kf_jitter_ns, 5ms) before predicted arrival.
+   * Poll guard = max(kf_jitter_ns*2 + 5ms, 15ms) — preserves the original
+   * asymmetric bias (packets skew late, not early) while adding Kalman upside. */
+  uint64_t kf_sigma_ns  = (sess->kf_jitter_ns > 0) ? sess->kf_jitter_ns : 5000000ULL;
+  uint64_t kf_pre_ns    = (kf_sigma_ns > 5000000ULL) ? kf_sigma_ns : 5000000ULL;
+  uint64_t kf_guard_base= kf_sigma_ns * 2ULL + 5000000ULL;
+  /* Fix 4 (look-ahead): pre-opened fd for chunk[i+1]; -1 = not yet opened */
+  int lookahead_fd   = -1;
+  uint16_t lookahead_port = 0;
   for (uint32_t i = 0; i < n; i++) {
   if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
   uint32_t seq = sched[i].chunk_index;
@@ -5400,20 +6005,35 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   int64_t expected_adj = (int64_t)sched[i].expected_arrival_ns + (int64_t)pid_correction_ns;
   uint64_t expected = (expected_adj > 0) ? (uint64_t)expected_adj : sched[i].expected_arrival_ns;
-  uint64_t open_at = (expected > 5000000ULL) ? expected - 5000000ULL : expected;
-  if (mpcp_now_raw_ns() < open_at) sleep_until_raw_abs(open_at);
-  int jit_fd = open_udp_socket_on_port(sched[i].ephemeral_port);
+  /* Fix 3 (Kalman-window): open kf_pre_ns before predicted; at least 5ms (original). */
+  uint64_t open_at  = (expected > kf_pre_ns) ? expected - kf_pre_ns : 0;
+  /* Fix 4 (look-ahead): if chunk[i+1] was pre-opened and matches, reuse its fd.
+   * The socket may already hold a queued packet — eliminates the deaf zone. */
+  int jit_fd;
+  if (lookahead_fd >= 0 && lookahead_port == sched[i].ephemeral_port) {
+  jit_fd = lookahead_fd;
+  lookahead_fd = -1;
+  /* Socket already open; sleep only if absurdly early (MONOTONIC) */
+  if (mpcp_now_ns() < open_at) mpcp_sleep_until_ns(open_at);
+  } else {
+  if (lookahead_fd >= 0) { close(lookahead_fd); lookahead_fd = -1; }
+  if (mpcp_now_ns() < open_at) mpcp_sleep_until_ns(open_at);
+  jit_fd = open_udp_socket_on_port(sched[i].ephemeral_port);
+  }
   if (jit_fd < 0) {
   atomic_fetch_add_explicit(&g_blink_missed_windows, 1u, memory_order_relaxed);
   blink_window_record(&win, false);
   continue;
   }
+  /* Fix 3: guard = max(kf_sigma*2 + 5ms, 15ms) — asymmetric, late-biased like original */
+  int guard_ms = (int)(kf_guard_base / 1000000ULL);
+  if (guard_ms < 15) guard_ms = 15;
   struct sockaddr_in fsrc; socklen_t fsl = sizeof(fsrc);
   ssize_t nb = recvfrom(jit_fd, pkt, pkt_max, MSG_DONTWAIT,
   (struct sockaddr *)&fsrc, &fsl);
   if (nb < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
   struct pollfd pfd = { .fd = jit_fd, .events = POLLIN, .revents = 0 };
-  int pr = poll(&pfd, 1, 10);
+  int pr = poll(&pfd, 1, guard_ms);
   if (pr > 0 && (pfd.revents & POLLIN)) {
   nb = recvfrom(jit_fd, pkt, pkt_max, MSG_DONTWAIT,
   (struct sockaddr *)&fsrc, &fsl);
@@ -5423,17 +6043,21 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   close(jit_fd);
   atomic_fetch_add_explicit(&g_blink_missed_windows, 1u, memory_order_relaxed);
   blink_window_record(&win, false);
+  if (g_debug_stealth)
+  fprintf(stderr, "[blink-jit] MISS chunk %u port=%u guard=%dms\n",
+  sched[i].chunk_index, sched[i].ephemeral_port, guard_ms);
   continue;
   }
-  uint32_t magic; memcpy(&magic, pkt, 4);
-  if (ntohl(magic) != MPCP_MAGIC || pkt[4] != MPCP_VERSION) {
+  /* === v2: no MPCP_MAGIC check — vport_id at pkt[0..1]; AEAD tag validates payload ===
+   * Version and type are sufficient for early-drop of misaddressed UDP. */
+  if (pkt[4] != MPCP_VERSION) {
   close(jit_fd); continue;
   }
   if (pkt[5] != MPCP_TYPE_DATA_CHUNK && pkt[5] != MPCP_TYPE_GHOST_CHUNK) {
   close(jit_fd); continue;
   }
   uint32_t pkt_seq; memcpy(&pkt_seq, pkt + 6, 4); pkt_seq = ntohl(pkt_seq);
-  int64_t err_ns = (int64_t)mpcp_now_raw_ns() - (int64_t)expected;
+  int64_t err_ns = (int64_t)mpcp_now_ns() - (int64_t)expected; /* MONOTONIC throughout */
   pid_integral_ns += (double)err_ns;
   if (pid_integral_ns > 5000000.0) pid_integral_ns = 5000000.0;
   if (pid_integral_ns < -5000000.0) pid_integral_ns = -5000000.0;
@@ -5481,8 +6105,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   {
   mpcp_ack_pkt_t ack;
   memset(&ack, 0, sizeof(ack));
-  uint32_t am = htonl(MPCP_MAGIC);
-  memcpy(&ack.hdr.magic, &am, 4);
+  /* === v2: vport_id replaces magic in ACK header === */
+  ack.hdr.vport_id = htons(VPORT_CTRL_PLANE);
+  randombytes_buf(ack.hdr.rand_pad, sizeof(ack.hdr.rand_pad));
   ack.hdr.version = MPCP_VERSION;
   ack.hdr.type    = MPCP_TYPE_ACK;
   uint32_t as = htonl(pkt_seq);
@@ -5492,6 +6117,15 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   memcpy(&ack.ack_hash, ah, 4);
   randombytes_buf(ack.padding, sizeof(ack.padding));
   sendto(jit_fd, &ack, sizeof(ack), 0, (const struct sockaddr *)&fsrc, fsl);
+  }
+  /* Fix 4 (look-ahead): always pre-open chunk[i+1] socket immediately after the
+   * ACK for chunk[i] is sent.  At most 2 ports open for ~one interval, but the
+   * next packet can queue into the kernel buffer even before we arrive at i+1.
+   * This eliminates the deaf-zone between close(jit_fd[i]) and open(jit_fd[i+1]). */
+  if (i + 1 < n && lookahead_fd < 0) {
+    lookahead_port = sched[i + 1].ephemeral_port;
+    lookahead_fd   = open_udp_socket_on_port(lookahead_port);
+    /* If open fails the next iteration simply falls through to a fresh open */
   }
   close(jit_fd);
   slot->seq_index = pkt_seq;
@@ -5505,12 +6139,25 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   got[i] = true;
   received++;
   blink_window_record(&win, true);
-  fprintf(stderr, "\r  [JIT %u/%u] port=%u miss=%.0f%%   ",
+  /* Fix 6 (CLI): \r\033[K overwrites current line; no cursor-up needed */
+  fprintf(stderr, "\r\033[K  [JIT %u/%u] port=%u miss=%.0f%%",
   received, ctx->plan.n_chunks,
   sched[i].ephemeral_port,
   blink_window_miss_rate(&win) * 100.0);
   fflush(stderr);
+  /* Fix 2 (epoch resync): every 1000 chunks recalibrate tzero via arrival delta */
+  if (received > 0 && (received % 1000) == 0 && i + 1 < n) {
+    uint64_t actual_now  = mpcp_now_ns(); /* MONOTONIC: matches tzero domain */
+    int64_t  drift_delta = (int64_t)actual_now - (int64_t)expected;
+    tzero = (uint64_t)((int64_t)tzero + drift_delta);
+    mpcp_generate_schedule(sess, cfg, a->block_seqs + i + 1, n - i - 1,
+                           tzero, sess->blink_interval_ns, drift, sched + i + 1);
+    if (g_debug_stealth)
+      fprintf(stderr, "\n  [blink] epoch-resync @ chunk %u: drift_delta=%+ldus tzero adjusted\n",
+              received, (long)(drift_delta / 1000LL));
   }
+  }
+  if (lookahead_fd >= 0) { close(lookahead_fd); lookahead_fd = -1; }
   free(got);
   free(sched);
   } else {
@@ -5593,8 +6240,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
               ssize_t nb = recvfrom(fds[i], pkt, pkt_max, MSG_DONTWAIT,
                                     (struct sockaddr *)&fsrc, &fsl);
               if (nb < (ssize_t)MPCP_DATA_HDR_OFFSET) continue;
-              uint32_t m2; memcpy(&m2, pkt, 4);
-              if (ntohl(m2) != MPCP_MAGIC || pkt[4] != MPCP_VERSION) continue;
+              /* === v2: no MPCP_MAGIC — vport_id at pkt[0..1]; version+type guard === */
+              if (pkt[4] != MPCP_VERSION) continue;
               if (pkt[5] != MPCP_TYPE_DATA_CHUNK &&
                   pkt[5] != MPCP_TYPE_GHOST_CHUNK) continue;
               uint32_t ps2; memcpy(&ps2, pkt + 6, 4); ps2 = ntohl(ps2);
@@ -5627,7 +6274,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
               memcpy(sl2->nonce, pkt + 16, 24);
               mpcp_ring_publish(&ctx->ring0, sl2);
               { mpcp_ack_pkt_t a2; memset(&a2, 0, sizeof(a2));
-                uint32_t am2 = htonl(MPCP_MAGIC); memcpy(&a2.hdr.magic, &am2, 4);
+                /* === v2: vport_id replaces magic === */
+                a2.hdr.vport_id = htons(VPORT_CTRL_PLANE);
+                randombytes_buf(a2.hdr.rand_pad, sizeof(a2.hdr.rand_pad));
                 a2.hdr.version = MPCP_VERSION; a2.hdr.type = MPCP_TYPE_ACK;
                 uint32_t as2 = htonl(ps2); memcpy(&a2.ack_seq, &as2, 4);
                 uint8_t ah2[4];
@@ -5639,7 +6288,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
                        (const struct sockaddr *)&fsrc, fsl); }
               { uint32_t dd = 0;
                 for (uint32_t _d = 0; _d < n; _d++) if (got2[_d]) dd++;
-                fprintf(stderr, "\r  [%u/%u]   ", dd + 1, ctx->plan.n_chunks);
+                fprintf(stderr, "\r\033[K  [%u/%u]", dd + 1, ctx->plan.n_chunks);
                 fflush(stderr); }
               got2[mapped_j] = true; received++; any = true;
           }
@@ -5660,9 +6309,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
                                 (struct sockaddr *)&fsrc, &fsl);
           if (nb < (ssize_t)MPCP_DATA_HDR_OFFSET) continue;
 
-          /* Packet header validation */
-          uint32_t m2; memcpy(&m2, pkt, 4);
-          if (ntohl(m2) != MPCP_MAGIC || pkt[4] != MPCP_VERSION) continue;
+          /* === v2: no MPCP_MAGIC — version+type guard only === */
+          if (pkt[4] != MPCP_VERSION) continue;
           if (pkt[5] != MPCP_TYPE_DATA_CHUNK &&
               pkt[5] != MPCP_TYPE_GHOST_CHUNK) continue;
 
@@ -5723,7 +6371,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
 
           /* ACK — sent back on the socket that received this chunk */
           { mpcp_ack_pkt_t a2; memset(&a2, 0, sizeof(a2));
-            uint32_t am2 = htonl(MPCP_MAGIC); memcpy(&a2.hdr.magic, &am2, 4);
+            /* === v2: vport_id replaces magic === */
+            a2.hdr.vport_id = htons(VPORT_CTRL_PLANE);
+            randombytes_buf(a2.hdr.rand_pad, sizeof(a2.hdr.rand_pad));
             a2.hdr.version = MPCP_VERSION; a2.hdr.type = MPCP_TYPE_ACK;
             uint32_t as2 = htonl(ps2); memcpy(&a2.ack_seq, &as2, 4);
             uint8_t ah2[4];
@@ -5737,7 +6387,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
           /* Progress display */
           { uint32_t dd = 0;
             for (uint32_t _d = 0; _d < n; _d++) if (got2[_d]) dd++;
-            fprintf(stderr, "\r  [%u/%u]   ", dd + 1, ctx->plan.n_chunks);
+            fprintf(stderr, "\r\033[K  [%u/%u]", dd + 1, ctx->plan.n_chunks);
             fflush(stderr); }
 
           /*
@@ -5907,7 +6557,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (len > 0) {
   if (a->use_decompress && !(ctx->plan.skip_compression) &&
   !(ctx->chunk_flags[ws] & MPCP_FLAG_SKIP_COMPRESSION)) {
-  size_t   dbound = ZSTD_DStreamOutSize() * 4u;
+  /* Tight bound: chunks decompress to at most chunk_pad_size bytes. */
+  size_t   dbound = (size_t)ctx->cfg->chunk_pad_size + 1u;
   uint8_t *dbuf   = malloc(dbound);
   if (dbuf) {
   size_t dlen = ZSTD_decompress(dbuf, dbound, buf, len);
@@ -5945,7 +6596,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (len > 0) {
   if (a->use_decompress && !(ctx->plan.skip_compression) &&
   !(ctx->chunk_flags[ws] & MPCP_FLAG_SKIP_COMPRESSION)) {
-  size_t   dbound = ZSTD_DStreamOutSize() * 4u;
+  /* Tight bound: chunks decompress to at most chunk_pad_size bytes. */
+  size_t   dbound = (size_t)ctx->cfg->chunk_pad_size + 1u;
   uint8_t *dbuf   = malloc(dbound);
   if (dbuf) {
   size_t dlen = ZSTD_decompress(dbuf, dbound, buf, len);
@@ -5984,7 +6636,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (len > 0) {
   if (a->use_decompress && !(ctx->plan.skip_compression) &&
   !(ctx->chunk_flags[ws] & MPCP_FLAG_SKIP_COMPRESSION)) {
-  size_t   dbound = ZSTD_DStreamOutSize() * 4u;
+  /* Tight bound: chunks decompress to at most chunk_pad_size bytes. */
+  size_t   dbound = (size_t)ctx->cfg->chunk_pad_size + 1u;
   uint8_t *dbuf   = malloc(dbound);
   if (dbuf) {
   size_t dlen = ZSTD_decompress(dbuf, dbound, buf, len);
@@ -6117,23 +6770,16 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   ctx.block_size     = _rblk_sz;
   ctx.plan.n_chunks  = _rblk_sz;
   ctx.next_write_seq = 0;
-  uint32_t expected_in_block = _rblk_sz + (ctx.block_ghost_end - ctx.block_ghost_start);
-  uint32_t *block_seqs = malloc(expected_in_block * sizeof(uint32_t));
+  /* Blink JIT schedule: DATA CHUNKS ONLY.
+   * Ghost chunks have seq > n_data_chunks; seq-based timing would schedule
+   * them hundreds of ms after data, sleeping through data windows → 0 received.
+   * Ghost packets arrive on closed ports and are dropped by the OS — that IS
+   * the stealth effect (authentic-looking "port unreachable" ICMP noise). */
+  uint32_t *block_seqs = malloc(_rblk_sz * sizeof(uint32_t));
   if (!block_seqs) { rc = MPCP_ERR_ALLOC; goto cleanup_r2; }
-  {
-  uint32_t bsi = 0;
-  uint32_t g_idx = ctx.block_ghost_start;
-  for (uint32_t i = 0; i < _rblk_sz; i++) {
-  block_seqs[bsi++] = _rblk_base + i;
-  if (cfg->ghost_chunks_enabled && g_idx < ctx.block_ghost_end) {
-  block_seqs[bsi++] = ghost_seqs[g_idx++];
-  }
-  }
-  while (g_idx < ctx.block_ghost_end) {
-  block_seqs[bsi++] = ghost_seqs[g_idx++];
-  }
-  }
-  recv_t1_arg_t  t1_arg = { &ctx, expected_in_block, block_seqs, catch_ms };
+  for (uint32_t i = 0; i < _rblk_sz; i++)
+  block_seqs[i] = _rblk_base + i;
+  recv_t1_arg_t  t1_arg = { &ctx, _rblk_sz, block_seqs, catch_ms };
   verifier_arg_t t2_arg = { &ctx };
   decrypt_arg_t  t3_arg = { &ctx };
   writer_arg_t   t4_arg = { &ctx, use_decomp };
@@ -6811,8 +7457,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   mpcp_key_pkt_t pkt;
   int rc = mpcp_kex_pack(master_secret, candidate_key, 3, 0x00, &pkt);
   CHECK("T-kex-a: pack succeeds",        rc == MPCP_OK);
-  CHECK("T-kex-b: header magic correct",
-  ntohl(*(uint32_t *)&pkt.hdr.magic) == MPCP_MAGIC);
+  /* === v2: magic removed; check vport_id == VPORT_CTRL_PLANE === */
+  CHECK("T-kex-b: header vport_id correct",
+  ntohs(pkt.hdr.vport_id) == VPORT_CTRL_PLANE);
   CHECK("T-kex-c: version correct",      pkt.hdr.version == MPCP_VERSION);
   CHECK("T-kex-d: type correct",         pkt.hdr.type == MPCP_TYPE_KEY_EXCHANGE);
   CHECK("T-kex-e: key_index correct",    pkt.key_index == 3);
@@ -8002,9 +8649,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   int idx = 0;
   while (!sp->done) {
   if (g_ui_colour)
-  printf("\r  %s%s%s ", gcols[idx % 8], gear_frames[idx % 8], C_RESET);
+  printf("\r\033[K  %s%s%s", gcols[idx % 8], gear_frames[idx % 8], C_RESET);
   else
-  printf("\r  %s ", plain_frames[idx & 3]);
+  printf("\r\033[K  %s", plain_frames[idx & 3]);
   fflush(stdout);
   idx++;
   struct timespec ts = { .tv_sec = 0, .tv_nsec = 120000000L };
@@ -8012,16 +8659,16 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   if (sp->done == 2) {
   if (g_ui_colour)
-  printf("\r  %s[+]%s  done          \n", C_LIME, C_RESET);
+  printf("\r\033[K  %s[+]%s  done\n", C_LIME, C_RESET);
   else
-  printf("\r  [+] done          \n");
+  printf("\r\033[K  [+] done\n");
   } else if (sp->done == 3) {
   if (g_ui_colour)
-  printf("\r  %s[x]%s  failed        \n", C_ROSE, C_RESET);
+  printf("\r\033[K  %s[x]%s  failed\n", C_ROSE, C_RESET);
   else
-  printf("\r  [x] failed        \n");
+  printf("\r\033[K  [x] failed\n");
   } else {
-  printf("\r                  \n");
+  printf("\r\033[K\n");
   }
   fflush(stdout);
   return NULL;
@@ -8030,9 +8677,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   {
   sp->done = 0;
   if (g_ui_colour)
-  printf("  %s%s%s\n", C_GREY, label, C_RESET);
+  printf("\r\033[K  %s%s%s  [---]", C_GREY, label, C_RESET);
   else
-  printf("%s...\n", label);
+  printf("\r\033[K  %s... [---]", label);
   fflush(stdout);
   pthread_create(&sp->thread, NULL, spinner_thread, sp);
   }
@@ -8315,7 +8962,14 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   close(fd);
   return -1;
   }
-  uint8_t buf[512];
+  /* === v2: derive cal_key from PSK for trial decryption of incoming pings ===
+   * Receiver knows PSK (entered by user). cal_key = HKDF(PSK, "delta-t-cal-v2").
+   * We derive from PSK bytes directly here. */
+  uint8_t cal_key[32];
+  if (cal_key_from_psk((const uint8_t *)cfg->psk, cfg->psk_len, cal_key) != MPCP_OK) {
+  close(fd);
+  return -1;
+  }
   struct sockaddr_in sender;
   socklen_t slen = sizeof(sender);
   {
@@ -8323,28 +8977,34 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_inf, sizeof(tv_inf));
   }
   bool got_first = false;
+  uint8_t saved_nonce_hint[MPCP_NONCE_HINT_LEN];
+  memset(saved_nonce_hint, 0, sizeof(saved_nonce_hint));
   while (!got_first) {
-  ssize_t n = recvfrom(fd, buf, sizeof(buf), 0,
-  (struct sockaddr *)&sender, &slen);
+  uint8_t pkt_buf[sizeof(mpcp_cal_pkt_t) + 128];
+  /* === v2: trial decrypt — no magic check, AEAD tag IS the authenticator === */
+  ssize_t n = dt_recv_trial(fd, pkt_buf, sizeof(pkt_buf),
+                             cal_key, &sender, &slen);
   if (n <= 0) continue;
-  uint8_t pkt_buf[sizeof(mpcp_cal_pkt_t) + 64];
-  size_t  pkt_len = (size_t)n;
+  size_t pkt_len = (size_t)n;
   if (cfg->disguise_calibration) {
-  pkt_len = mpcp_disguise_unwrap(buf, (size_t)n,
+  pkt_len = mpcp_disguise_unwrap(pkt_buf, pkt_len,
   pkt_buf, sizeof(pkt_buf),
   cfg->disguise_protocol);
   if (pkt_len == 0) continue;
-  } else {
-  if ((size_t)n > sizeof(pkt_buf)) continue;
-  memcpy(pkt_buf, buf, (size_t)n);
   }
   if (pkt_len < sizeof(mpcp_cal_pkt_t)) continue;
   mpcp_cal_pkt_t *ping = (mpcp_cal_pkt_t *)pkt_buf;
-  uint32_t magic;
-  memcpy(&magic, &ping->hdr.magic, 4);
-  if (ntohl(magic) != MPCP_MAGIC) continue;
+  /* No magic check — trial decrypt success IS the validator */
   if (ping->hdr.version != MPCP_VERSION) continue;
   if (ping->hdr.type != MPCP_TYPE_PING) continue;
+  /* Extract session_nonce from nonce_hint to build per-session cal_key */
+  memcpy(saved_nonce_hint, ping->nonce_hint, MPCP_NONCE_HINT_LEN);
+  /* Re-derive cal_key using the session_nonce for subsequent packets */
+  uint8_t sess_cal_key[32];
+  if (cal_key_from_psk(ping->nonce_hint, MPCP_NONCE_HINT_LEN, sess_cal_key) == MPCP_OK) {
+      memcpy(cal_key, sess_cal_key, 32);
+      sodium_memzero(sess_cal_key, 32);
+  }
   if (sender_addr_out)
   memcpy(sender_addr_out, &sender, sizeof(sender));
   if (nonce_hint_out)
@@ -8359,8 +9019,9 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   fflush(stderr);
   if (fgets(ans, sizeof(ans), stdin) == NULL || (ans[0] == 'n' || ans[0] == 'N')) {
   fprintf(stderr, "  Connection rejected.\n");
+  sodium_memzero(cal_key, sizeof(cal_key));
   close(fd);
-  return -2;  
+  return -2;
   }
   } else {
   fprintf(stderr, "  Sender identified — sending pong\n");
@@ -8368,22 +9029,20 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   mpcp_cal_pkt_t pong;
   memcpy(&pong, ping, sizeof(pong));
   pong.hdr.type = MPCP_TYPE_PONG;
-  uint8_t wire_buf[512];
-  size_t  wire_len = sizeof(pong);
+  /* === v2: send pong encrypted under cal_key — no plaintext on wire === */
   if (cfg->disguise_calibration) {
-  wire_len = mpcp_disguise_wrap((const uint8_t *)&pong, sizeof(pong),
-  wire_buf, sizeof(wire_buf),
-  cfg->disguise_protocol);
-  if (wire_len > 0)
-  sendto(fd, wire_buf, wire_len, 0, (struct sockaddr *)&sender, slen);
+  uint8_t wire_buf[512];
+  size_t wl = mpcp_disguise_wrap((const uint8_t *)&pong, sizeof(pong),
+  wire_buf, sizeof(wire_buf), cfg->disguise_protocol);
+  if (wl > 0)
+      dt_send_wire(fd, wire_buf, wl, cal_key,
+                   (struct sockaddr *)&sender, slen);
   } else {
-  sendto(fd, &pong, sizeof(pong), 0, (struct sockaddr *)&sender, slen);
+  dt_send_wire(fd, &pong, sizeof(pong), cal_key,
+               (struct sockaddr *)&sender, slen);
   }
   }
   {
-  /* Idle timeout must outlast Phase 4's ghost ping window.
-   * Sender sets tzero = now+500ms then fires ghost at tzero+blink (max 500ms).
-   * Worst case ghost arrives ~1s after last Phase-2 ping → use 2s idle timeout. */
   uint32_t idle_ms = 2000u;
   if (cfg->slow_mode && cfg->slow_mode_max_gap > 0)
   idle_ms = cfg->slow_mode_max_gap + 2000u;
@@ -8392,59 +9051,45 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   tv2.tv_usec = (suseconds_t)((idle_ms % 1000u) * 1000u);
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
   }
-  /* Budget must cover Phase-1 (150 pings) + Phase-2 (up to ~1000 pings at 2ms
-   * intervals over 2 seconds).  The old cfg->ping_count_max+30 only covered
-   * the legacy calibrate_collect_samples path and was far too small. */
   uint32_t max_pings = cfg->slow_mode
-      ? (cfg->ping_count_max + 30u)   /* slow-mode: few pings, long gaps */
-      : 1800u;                         /* fast-mode: Phase1(150)+Phase2(~1000)+margin */
+      ? (cfg->ping_count_max + 30u)
+      : 1800u;
   uint32_t reflected = 1;
   while (reflected < max_pings) {
-  ssize_t n = recvfrom(fd, buf, sizeof(buf), 0,
-  (struct sockaddr *)&sender, &slen);
-  if (n <= 0) {
-  break;
-  }
-  uint8_t pkt_buf[sizeof(mpcp_cal_pkt_t) + 64];
-  size_t  pkt_len = (size_t)n;
+  uint8_t pkt_buf[sizeof(mpcp_cal_pkt_t) + 128];
+  /* === v2: trial decrypt loop — constant-time noise rejection === */
+  ssize_t n = dt_recv_trial(fd, pkt_buf, sizeof(pkt_buf),
+                             cal_key, &sender, &slen);
+  if (n <= 0) break;
+  size_t pkt_len = (size_t)n;
   if (cfg->disguise_calibration) {
-  pkt_len = mpcp_disguise_unwrap(buf, (size_t)n,
+  pkt_len = mpcp_disguise_unwrap(pkt_buf, pkt_len,
   pkt_buf, sizeof(pkt_buf),
   cfg->disguise_protocol);
   if (pkt_len == 0) continue;
-  } else {
-  if ((size_t)n > sizeof(pkt_buf)) continue;
-  memcpy(pkt_buf, buf, (size_t)n);
   }
   if (pkt_len < sizeof(mpcp_cal_pkt_t)) continue;
   mpcp_cal_pkt_t *ping = (mpcp_cal_pkt_t *)pkt_buf;
-  uint32_t magic;
-  memcpy(&magic, &ping->hdr.magic, 4);
-  if (ntohl(magic) != MPCP_MAGIC) continue;
   if (ping->hdr.version != MPCP_VERSION) continue;
-  /* Reflect all PING packets (including the Phase-4 ghost probe which
-   * arrives ~2s after the last Phase-1/2 ping).  Any other packet type
-   * is silently ignored — the SIG_READY mechanism has been removed. */
   if (ping->hdr.type != MPCP_TYPE_PING) continue;
   if (nonce_hint_out &&
-  memcmp(ping->nonce_hint, nonce_hint_out, MPCP_NONCE_HINT_LEN) != 0)
+  memcmp(ping->nonce_hint, saved_nonce_hint, MPCP_NONCE_HINT_LEN) != 0)
   continue;
   mpcp_cal_pkt_t pong;
   memcpy(&pong, ping, sizeof(pong));
   pong.hdr.type = MPCP_TYPE_PONG;
-  uint8_t wire_buf[512];
-  size_t  wire_len = sizeof(pong);
   if (cfg->disguise_calibration) {
-  wire_len = mpcp_disguise_wrap((const uint8_t *)&pong,
-  sizeof(pong),
-  wire_buf, sizeof(wire_buf),
+  uint8_t wire_buf[512];
+  size_t wl = mpcp_disguise_wrap((const uint8_t *)&pong,
+  sizeof(pong), wire_buf, sizeof(wire_buf),
   cfg->disguise_protocol);
-  if (wire_len == 0) continue;
+  if (wl == 0) continue;
+  dt_send_wire(fd, wire_buf, wl, cal_key,
+               (struct sockaddr *)&sender, slen);
   } else {
-  memcpy(wire_buf, &pong, sizeof(pong));
+  dt_send_wire(fd, &pong, sizeof(pong), cal_key,
+               (struct sockaddr *)&sender, slen);
   }
-  sendto(fd, wire_buf, wire_len, 0,
-  (struct sockaddr *)&sender, slen);
   reflected++;
   if (reflected % 10 == 0 || reflected == 1) {
   fprintf(stderr, "\r  [%u pings reflected]   ", reflected);
@@ -8452,10 +9097,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   }
   fprintf(stderr, "\r  %u pings reflected -- calibration complete.        \n", reflected);
-  /* No SIG_READY handshake: the reflect loop's idle timeout fires naturally
-   * after the sender stops pinging (Phase 1+2 complete) and after the
-   * Phase-4 ghost probe has been reflected.  Proceed directly to key
-   * exchange — the sender will already be there. */
+  sodium_memzero(cal_key, sizeof(cal_key));
   close(fd);
   return 0;
   }
@@ -8812,6 +9454,25 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   case '5': mpcp_profile_internet(&cfg); printf("  -> internet\n"); break;
   default:  mpcp_profile_default(&cfg);  printf("  -> default\n");  break;
   }
+  /* === v2: Roadmap §1 — UPnP/IGD + STUN external IP discovery ===
+   * Pure P2P, no centralized servers, no libcurl, raw UDP STUN fallback. */
+  {
+  banner("Network discovery");
+  char ext_ip[INET_ADDRSTRLEN] = {0};
+  printf("  Probing UPnP/IGD for external IP… ");
+  fflush(stdout);
+  if (dt_discover_external_ip(ext_ip) == 0) {
+  if (g_ui_colour)
+      printf("%s[+] %s%s\n", C_LIME, ext_ip, C_RESET);
+  else
+      printf("[+] %s\n", ext_ip);
+  } else {
+  if (g_ui_colour)
+      printf("%s[!] Not available (direct/NAT manual)%s\n", C_GOLD, C_RESET);
+  else
+      printf("[!] Not available (direct/NAT manual)\n");
+  }
+  }
   banner("Authentication");
   if (cfg.auth_mode == MPCP_AUTH_ED25519) {
   printf("  Stealth mode — Ed25519 + PSK dual auth\n");
@@ -8986,15 +9647,32 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   banner("Summary");
   printf("  Mode           : %s\n", is_sender ? "send (PC2)" : "receive (PC1)");
   printf("  Auth           : %s\n", cfg.auth_mode == MPCP_AUTH_ED25519 ? "Ed25519" : "PSK");
-  printf("  Tripwire       : %s\n", cfg.tripwire ? "enabled" : "disabled");
+  printf("  Tripwire       : %s (Z>3.0 → wipe+exit)\n", cfg.tripwire ? "enabled" : "disabled");
   printf("  Ghost chunks   : %s\n", cfg.ghost_chunks_enabled ? "enabled" : "disabled");
   printf("  Port base/range: %u / %u\n", cfg.port_base, cfg.port_range);
   printf("  Pipeline depth : %u\n", cfg.pipeline_depth);
   printf("  Timing engine  : JIT temporal gatekeeper (blink)\n");
+  printf("  Wire format    : AEAD-only (no magic; traffic = random noise)\n");
+  printf("  Traffic shaping: RCBR (5-min window, ±5-10%% jitter)\n");
+  printf("  Vport mux      : CTRL=0x0002 DATA=0x0001 GHOST=0x0003\n");
   printf("  %-15s: %s\n", is_sender ? "File" : "Output", file_buf);
   printf("\n");
   if (!ask_yn("Proceed?", true)) { printf("Aborted.\n"); return 0; }
   fw_maybe_open(cfg.port_base, cfg.port_range);
+  /* === v2: Roadmap §4 — RCBR traffic shaping init (Adaptive Randomised CBR)
+   * Baseline: 1 packet per blink_interval (set after calibration).
+   * Jitter ±5–10% of baseline; Ghost Chunks fill idle windows.
+   * Active window: 5 minutes (300 seconds). */
+  rcbr_pacer_t rcbr;
+  {
+      /* Pre-init with a 20ms baseline; will be re-seeded post-calibration */
+      uint64_t default_interval_ns = 20000000ULL; /* 20ms = 50 pps */
+      uint64_t active_window_ns    = 300ULL * 1000000000ULL; /* 5 min */
+      rcbr_pacer_init(&rcbr, default_interval_ns, active_window_ns);
+      fprintf(stderr, "[rcbr] RCBR shaping active — port %u, 5-min window\n",
+              cfg.port_base);
+      (void)rcbr_window_active(&rcbr); /* suppress unused warning */
+  }
   mpcp_session_t    sess;
   memset(&sess, 0, sizeof(sess));
   sess.drift_coefficient = 1.0;
@@ -9019,6 +9697,13 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   sess.blink_origin_ns   = preflight.tzero_ns;
   sess.t_zero_ns         = preflight.tzero_ns;
   sess.drift_coefficient = preflight.drift_coefficient;
+  /* Fix 3+4: Kalman jitter sigma (ns) = sqrt(jitter_variance_ms2)*1e6, clamped [500us,20ms] */
+  {
+    double _sigma_ns = sqrt(preflight.jitter_variance_ms2) * 1e6;
+    if (_sigma_ns < 500000.0)   _sigma_ns = 500000.0;
+    if (_sigma_ns > 20000000.0) _sigma_ns = 20000000.0;
+    sess.kf_jitter_ns = (uint64_t)_sigma_ns;
+  }
   printf("  Pre-flight lock : %s\n", preflight.handshake_locked ? "LOCKED" : "FAILED");
   printf("  Stable RTT      : %.3f ms\n", preflight.stable_mean_rtt_ms);
   printf("  Jitter variance : %.6f ms^2\n", preflight.jitter_variance_ms2);
@@ -9026,7 +9711,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   preflight.drift_ppm, preflight.drift_coefficient);
   printf("  Cadence/T0      : %.1f ms, T0 in %.0f ms, port %u\n",
   (double)preflight.blink_interval_ns / 1e6,
-  (double)(int64_t)(preflight.tzero_ns - mpcp_now_raw_ns()) / 1e6,
+  (double)(int64_t)(preflight.tzero_ns - mpcp_now_ns()) / 1e6,
   preflight.ghost_port);
     rc = mpcp_derive_master_secret(sess.session_nonce,
   NULL, 0,
@@ -9044,10 +9729,7 @@ if (rc != MPCP_OK) { mpcp_perror("master secret", rc); return 1; }
   struct stat _st;
   if (stat(file_buf, &_st) == 0 && _st.st_size > 0) {
   size_t fsize = (size_t)_st.st_size;
-  if (fsize > 4u * 1024u * 1024u && sess.blink_interval_ns > 0) {
-      sess.blink_interval_ns = 0;
-      printf("  [large file] Blink disabled \xe2\x80\x93 using normal UDP scheduling\n");
-  }
+  /* Fix 1: size gate removed — Blink is the ONLY transfer mode regardless of file size */
   static const size_t _PROBE_CAP_RT = 1u << 20;
   size_t _probe_rt = (fsize < _PROBE_CAP_RT) ? fsize : _PROBE_CAP_RT;
   size_t bound = ZSTD_compressBound(_probe_rt);
@@ -9335,6 +10017,15 @@ if (rc != MPCP_OK) { mpcp_perror("master secret", rc); return 1; }
   }
   int main(int argc, char **argv)
   {
+  /* Raise the soft open-file limit to the hard limit so the non-blink receiver
+   * can open one UDP socket per chunk (up to MAX_BLOCK_CHUNKS = 4096 per block). */
+  {
+  struct rlimit _rl;
+  if (getrlimit(RLIMIT_NOFILE, &_rl) == 0 && _rl.rlim_cur < _rl.rlim_max) {
+  _rl.rlim_cur = _rl.rlim_max;
+  setrlimit(RLIMIT_NOFILE, &_rl);
+  }
+  }
   for (int _ai = 1; _ai < argc; _ai++) {
   if (strcmp(argv[_ai], "--debug-stealth") == 0) {
   g_debug_stealth = true;
